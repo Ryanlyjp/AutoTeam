@@ -2971,7 +2971,7 @@ def _auto_check_wait(interval_seconds, poll_seconds=0.2):
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, STATUS_AUTH_PENDING, is_account_disabled, load_accounts
-    from autoteam.codex_auth import check_codex_quota
+    from autoteam.codex_auth import check_codex_quota, quota_auth_error_is_unauthorized
     from autoteam.manager import (
         _auth_repair_skip_reason,
         _count_pool_active_accounts,
@@ -3024,7 +3024,7 @@ def _auto_check_loop():
                         low_accounts.append((acc["email"], remaining, status, info))
                 elif status == "exhausted":
                     low_accounts.append((acc["email"], 0, status, info))
-                elif status == "auth_error":
+                elif status == "auth_error" and quota_auth_error_is_unauthorized(info):
                     auth_problem_accounts.append(acc["email"])
             except Exception:
                 pass
@@ -3126,7 +3126,9 @@ def _auto_check_loop():
                 else:
                     team_shortage = max(0, target_seats - actual_team_count)
                     trigger_rotate = team_shortage > 0
-                    if not trigger_rotate and actual_team_count >= target_seats and actionable_repair_candidates:
+                    if not trigger_rotate and actual_team_count >= target_seats and auth_problem_accounts:
+                        trigger_rotate = True
+                    elif not trigger_rotate and actual_team_count >= target_seats and actionable_repair_candidates:
                         trigger_auth_repair = True
 
                 if (
@@ -3153,11 +3155,14 @@ def _auto_check_loop():
                         state = _collect_auto_check_state(accounts, cfg)
                         local_active_count = state["local_active_count"]
                         low_accounts = state["low_accounts"]
+                        auth_problem_accounts = state["auth_problem_accounts"]
                         actionable_repair_candidates = state["actionable_repair_candidates"]
                         throttled_repair_candidates = state["throttled_repair_candidates"]
                         seat_shortage = max(0, target_seats - 1 - local_active_count)
                         trigger_rotate = len(low_accounts) >= cfg["min_low"]
-                        if not trigger_rotate and actionable_repair_candidates:
+                        if not trigger_rotate and auth_problem_accounts:
+                            trigger_rotate = True
+                        elif not trigger_rotate and actionable_repair_candidates:
                             trigger_auth_repair = True
 
             if trigger_rotate or trigger_cleanup or trigger_auth_repair:

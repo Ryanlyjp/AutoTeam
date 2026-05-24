@@ -476,6 +476,85 @@ def test_cmd_check_force_auth_repair_ignores_cooldown(monkeypatch):
     assert calls == [("pending@example.com", "", "cloudmail")]
 
 
+def test_check_and_refresh_skips_refresh_when_quota_auth_is_hard_unauthorized(tmp_path, monkeypatch):
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps({"access_token": "token-401", "refresh_token": "refresh-401"}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        manager,
+        "check_codex_quota",
+        lambda _token: ("auth_error", {"reason": "unauthorized", "status_code": 401}),
+    )
+    monkeypatch.setattr(
+        manager,
+        "refresh_access_token",
+        lambda _token: (_ for _ in ()).throw(AssertionError("refresh should be skipped for hard 401/403 auth")),
+    )
+
+    status, info = manager._check_and_refresh({"email": "user@example.com", "auth_file": str(auth_file)})
+
+    assert status == "auth_error"
+    assert info == {"reason": "unauthorized", "status_code": 401}
+
+
+def test_cmd_check_deletes_hard_401_auth_accounts_instead_of_relogin(tmp_path, monkeypatch):
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(json.dumps({"access_token": "token-401"}), encoding="utf-8")
+
+    deleted = []
+    synced = []
+
+    class _FakeChatGPT:
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(
+        manager,
+        "load_accounts",
+        lambda: [
+            {
+                "email": "user@example.com",
+                "status": "active",
+                "password": "pw",
+                "auth_file": str(auth_file),
+                "mail_provider": "cloudmail",
+            }
+        ],
+    )
+    monkeypatch.setattr(manager, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(
+        manager,
+        "_check_and_refresh",
+        lambda _acc: ("auth_error", {"reason": "unauthorized", "status_code": 401}),
+    )
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", _FakeChatGPT)
+    monkeypatch.setattr(manager, "_get_account_mail_client", lambda _acc: _FakeMailClient())
+    monkeypatch.setattr(
+        manager,
+        "delete_managed_account",
+        lambda email, **kwargs: deleted.append((email, kwargs["remove_remote"], kwargs["sync_cpa_after"])),
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: synced.append("sync"))
+    monkeypatch.setattr(
+        manager,
+        "_login_codex_with_result",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("hard 401/403 auth should not relogin")),
+    )
+
+    exhausted = manager.cmd_check(force_auth_repair=False)
+
+    assert exhausted == []
+    assert deleted == [("user@example.com", True, False)]
+    assert synced == ["sync"]
+
+
 def test_cmd_check_preserves_low_active_for_seat2_preswitch(tmp_path, monkeypatch):
     auth_file = tmp_path / "active.json"
     auth_file.write_text(json.dumps({"access_token": "token-active"}), encoding="utf-8")

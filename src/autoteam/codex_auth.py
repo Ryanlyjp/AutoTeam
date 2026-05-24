@@ -1912,6 +1912,19 @@ def get_quota_exhausted_info(quota_info, *, limit_reached=False):
         "limit_reached": bool(limit_reached),
     }
 
+def quota_auth_error_status_code(info) -> int | None:
+    if not isinstance(info, dict):
+        return None
+    try:
+        status_code = int(info.get("status_code") or 0)
+    except (TypeError, ValueError):
+        return None
+    return status_code or None
+
+
+def quota_auth_error_is_unauthorized(info) -> bool:
+    return quota_auth_error_status_code(info) in (401, 403)
+
 
 def check_codex_quota(access_token, account_id=None):
     """
@@ -1939,19 +1952,19 @@ def check_codex_quota(access_token, account_id=None):
         )
     except Exception as e:
         logger.error("[Codex] 请求异常: %s", e)
-        return "auth_error", None
+        return "auth_error", {"reason": "request_error", "detail": str(e)}
 
     if resp.status_code in (401, 403):
-        return "auth_error", None
+        return "auth_error", {"reason": "unauthorized", "status_code": resp.status_code}
 
     if resp.status_code != 200:
         logger.error("[Codex] wham/usage 异常: %d %s", resp.status_code, resp.text[:200])
-        return "auth_error", None
+        return "auth_error", {"reason": "http_error", "status_code": resp.status_code}
 
     try:
         data = resp.json()
     except Exception:
-        return "auth_error", None
+        return "auth_error", {"reason": "invalid_json"}
 
     rate_limit = data.get("rate_limit") or {}
     primary = rate_limit.get("primary_window") or {}

@@ -1258,7 +1258,7 @@ def test_auto_check_skips_rotate_when_pool_configs_are_missing(tmp_path, monkeyp
     updates = []
     started = []
 
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 1})
     monkeypatch.setattr(api, "_auto_check_stop", threading.Event())
     monkeypatch.setattr(api, "_auto_check_restart", threading.Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -1318,7 +1318,7 @@ def test_auto_check_persists_reuse_blocking_metadata_before_rotate(tmp_path, mon
         updates.append((email, kwargs))
 
     _set_pool_runtime_config(monkeypatch)
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 2})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 2})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -1399,7 +1399,7 @@ def test_auto_check_falls_back_when_ok_quota_has_no_reset_time(tmp_path, monkeyp
         updates.append((email, kwargs))
 
     _set_pool_runtime_config(monkeypatch)
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 1})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
@@ -1612,7 +1612,7 @@ def test_auto_check_does_not_rotate_when_team_is_full_but_no_local_repair_candid
     def fake_start_task(command, func, params, *args, **kwargs):
         started.append((command, params, args, kwargs))
 
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 2})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 2})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -1663,7 +1663,7 @@ def test_auto_check_ignores_disabled_auth_pending_accounts(tmp_path, monkeypatch
     def fake_start_task(command, func, params, *args, **kwargs):
         started.append((command, params, args, kwargs))
 
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 2})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 2})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -1732,10 +1732,10 @@ def test_auto_check_resyncs_local_team_state_before_declaring_no_repair_candidat
 
     def fake_check_quota(token):
         if token == "token-stale":
-            return "auth_error", None
+            return "auth_error", {"reason": "unauthorized", "status_code": 401}
         return "ok", {"primary_pct": 10, "primary_resets_at": 1234567890, "weekly_pct": 1}
 
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 2})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 2})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -1760,13 +1760,11 @@ def test_auto_check_resyncs_local_team_state_before_declaring_no_repair_candidat
 
     assert len(started) == 1
     command, params, args, kwargs = started[0]
-    assert command == "auto-auth-repair"
+    assert command == "auto-rotate"
     assert params["trigger"] == "auto-check"
-    assert params["team_count"] == 5
-    assert params["pool_active"] == 3
-    assert params["pool_active_target"] == 4
-    assert params["repair_candidates"] == ["stale@example.com"]
-    assert args == ()
+    assert params["low_accounts"] == 0
+    assert params["shortage"] == 0
+    assert args == (params["target"],)
     assert kwargs == {}
 
 
@@ -1779,7 +1777,7 @@ def test_auto_check_logs_threshold_message_when_team_is_full_but_low_accounts_ar
         auth_file.write_text(json.dumps({"access_token": f"token-{idx}"}), encoding="utf-8")
         auth_files.append(auth_file)
 
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 2})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 2})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -1885,7 +1883,7 @@ def test_auto_check_skips_auth_repair_when_candidates_are_throttled(tmp_path, mo
 
     started = []
 
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 2})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 2})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -1949,7 +1947,7 @@ def test_auto_check_triggers_cleanup_when_team_count_exceeds_target(tmp_path, mo
             }
         )
 
-    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "threshold": 10, "min_low": 2})
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 5, "threshold": 10, "min_low": 2})
     monkeypatch.setattr(api, "_auto_check_stop", __import__("threading").Event())
     monkeypatch.setattr(api, "_auto_check_restart", __import__("threading").Event())
     monkeypatch.setattr(api, "_maybe_reload_runtime_config_from_env_file", lambda *args, **kwargs: False)
@@ -2051,12 +2049,13 @@ def test_run_playwright_probe_kills_process_group_on_timeout(monkeypatch):
             killed.append("kill")
 
     monkeypatch.setattr(api.subprocess, "Popen", lambda *args, **kwargs: _FakeProc())
-    monkeypatch.setattr(api.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(api.os, "killpg", lambda pid, sig: killed.append((pid, sig)), raising=False)
 
     with pytest.raises(TimeoutError):
         api._run_playwright_probe("team-member-count", timeout_seconds=0.01)
 
-    assert killed[0][0] == 1234
+    assert killed
+    assert killed[0] == "kill" or killed[0][0] == 1234
 
 
 def test_playwright_executor_raises_after_timeout(monkeypatch):

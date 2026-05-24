@@ -51,6 +51,8 @@ from autoteam.codex_auth import (
     get_quota_exhausted_info,
     get_saved_main_auth_file,
     login_codex_via_browser,
+    quota_auth_error_is_unauthorized,
+    quota_auth_error_status_code,
     quota_result_quota_info,
     quota_result_resets_at,
     refresh_access_token,
@@ -877,6 +879,13 @@ def _check_and_refresh(acc):
         return "no_auth", None
 
     status, info = check_codex_quota(access_token)
+    if status == "auth_error" and quota_auth_error_is_unauthorized(info):
+        logger.warning(
+            "[%s] quota auth returned HTTP %s; skip refresh and hand off to delete-and-refill flow",
+            email,
+            quota_auth_error_status_code(info),
+        )
+        return status, info
 
     # token 过期，尝试刷新
     if status == "auth_error" and rt:
@@ -893,6 +902,57 @@ def _check_and_refresh(acc):
             logger.error("[%s] token 刷新失败", email)
 
     return status, info
+
+
+def _delete_accounts_with_broken_auth(accounts_to_delete: list[dict]) -> list[str]:
+    deleted_emails = []
+    if not accounts_to_delete:
+        return deleted_emails
+
+    chatgpt = None
+    mail_clients = {}
+    try:
+        chatgpt = ChatGPTTeamAPI()
+        chatgpt.start()
+        for acc in accounts_to_delete:
+            _abort_if_cancel_requested()
+            email = acc["email"]
+            cache_key = _account_mail_cache_key(acc)
+            mail_client = mail_clients.get(cache_key)
+            remove_cloudmail = True
+            if mail_client is None and cache_key not in mail_clients:
+                try:
+                    mail_client = _get_account_mail_client(acc)
+                    mail_client.login()
+                except Exception as exc:
+                    logger.warning(
+                        "[check] failed to init mail client for %s; deleting account without mailbox cleanup: %s",
+                        email,
+                        exc,
+                    )
+                    mail_client = None
+                    remove_cloudmail = False
+                mail_clients[cache_key] = mail_client
+            elif mail_client is None:
+                remove_cloudmail = False
+
+            delete_managed_account(
+                email,
+                remove_remote=True,
+                remove_cloudmail=remove_cloudmail,
+                sync_cpa_after=False,
+                chatgpt_api=chatgpt,
+                mail_client=mail_client,
+            )
+            deleted_emails.append(email)
+            logger.info("[check] deleted hard-invalid auth account: %s", email)
+    finally:
+        if _chatgpt_session_ready(chatgpt):
+            chatgpt.stop()
+
+    if deleted_emails:
+        sync_to_cpa()
+    return deleted_emails
 
 
 def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_accounts=None):
@@ -1016,6 +1076,7 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
     # 检查有认证文件的账号额度
     exhausted_list = []
     auth_error_list = []
+    broken_auth_delete_list = []
 
     if active_with_auth:
         logger.info("[检查] 检查 %d 个 active/auth_pending 账号的额度...", len(active_with_auth))
@@ -1114,6 +1175,14 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                 )
                 exhausted_list.append(acc)
             elif status_str == "auth_error":
+                if quota_auth_error_is_unauthorized(info):
+                    logger.warning(
+                        "[%s] quota auth returned HTTP %s; delete account and let refill recover seats",
+                        email,
+                        quota_auth_error_status_code(info),
+                    )
+                    broken_auth_delete_list.append(acc)
+                    continue
                 # token 失效，先看历史额度（重置时间已过的不算）
                 lq = acc.get("last_quota")
                 if lq:
@@ -1168,6 +1237,10 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
         for a in no_auth_list:
             logger.info("[检查]   %s", a["email"])
         auth_error_list.extend(no_auth_list)
+    if broken_auth_delete_list:
+        logger.info("[check] deleting %d hard-invalid auth accounts (HTTP 401/403)...", len(broken_auth_delete_list))
+        deleted_emails = _delete_accounts_with_broken_auth(broken_auth_delete_list)
+        logger.info("[check] deleted %d hard-invalid auth accounts", len(deleted_emails))
     # auth_error + 无认证文件的统一重新登录 Codex
     if auth_error_list:
         logger.info("[检查] 重新登录 %d 个认证失效/待修复的账号...", len(auth_error_list))
