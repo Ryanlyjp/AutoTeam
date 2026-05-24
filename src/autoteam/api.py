@@ -88,6 +88,9 @@ class SetupConfig(BaseModel):
     CF_TEMP_EMAIL_BASE_URL: str = ""
     CF_TEMP_EMAIL_ADMIN_PASSWORD: str = ""
     CF_TEMP_EMAIL_DOMAIN: str = ""
+    TEMPMAIL_BASE_URL: str = ""
+    TEMPMAIL_API_KEY: str = ""
+    TEMPMAIL_DOMAIN: str = ""
     SYNC_TARGET_CPA: str | bool = ""
     CPA_URL: str = "http://127.0.0.1:8317"
     CPA_KEY: str = ""
@@ -105,6 +108,15 @@ class SetupConfig(BaseModel):
     SUB2API_OPENAI_WS_MODE: str = "off"
     SUB2API_OPENAI_PASSTHROUGH: str | bool = "false"
     SUB2API_OVERWRITE_ACCOUNT_SETTINGS: str | bool = "false"
+    EASYPROXY_ENABLED: str | bool = "false"
+    EASYPROXY_MANAGEMENT_URL: str = "http://127.0.0.1:9888"
+    EASYPROXY_PASSWORD: str = ""
+    EASYPROXY_PROXY_HOST: str = "127.0.0.1"
+    EASYPROXY_POOL_PORT: str | int = "2323"
+    EASYPROXY_PORT_MIN: str | int = "24000"
+    EASYPROXY_PORT_MAX: str | int = "24100"
+    EASYPROXY_COOLDOWN_MINUTES: str | int = "60"
+    EASYPROXY_MASTER_MODE: str = "direct"
     PLAYWRIGHT_PROXY_URL: str = ""
     PLAYWRIGHT_PROXY_BYPASS: str = ""
     API_KEY: str = ""
@@ -125,9 +137,13 @@ _RUNTIME_CONFIG_CLEARABLE_FIELDS = {
     "CF_TEMP_EMAIL_BASE_URL",
     "CF_TEMP_EMAIL_ADMIN_PASSWORD",
     "CF_TEMP_EMAIL_DOMAIN",
+    "TEMPMAIL_BASE_URL",
+    "TEMPMAIL_API_KEY",
+    "TEMPMAIL_DOMAIN",
     "SUB2API_GROUP",
     "SUB2API_PROXY",
     "SUB2API_MODEL_WHITELIST",
+    "EASYPROXY_PASSWORD",
     "PLAYWRIGHT_PROXY_URL",
     "PLAYWRIGHT_PROXY_BYPASS",
 }
@@ -138,6 +154,7 @@ _CF_TEMP_EMAIL_REQUIRED_KEYS = (
     "CF_TEMP_EMAIL_ADMIN_PASSWORD",
     "CF_TEMP_EMAIL_DOMAIN",
 )
+_TEMPMAIL_REQUIRED_KEYS = ("TEMPMAIL_BASE_URL", "TEMPMAIL_API_KEY")
 _CPA_REQUIRED_KEYS = ("CPA_URL", "CPA_KEY")
 _SUB2API_REQUIRED_KEYS = ("SUB2API_URL", "SUB2API_EMAIL", "SUB2API_PASSWORD")
 _SYNC_TARGET_TOGGLE_KEYS = ("SYNC_TARGET_CPA", "SYNC_TARGET_SUB2API")
@@ -153,6 +170,9 @@ _ALL_RUNTIME_ENV_KEYS = [
     "CF_TEMP_EMAIL_BASE_URL",
     "CF_TEMP_EMAIL_ADMIN_PASSWORD",
     "CF_TEMP_EMAIL_DOMAIN",
+    "TEMPMAIL_BASE_URL",
+    "TEMPMAIL_API_KEY",
+    "TEMPMAIL_DOMAIN",
     "CHATGPT_ACCOUNT_ID",
     "SYNC_TARGET_CPA",
     "CPA_URL",
@@ -171,6 +191,15 @@ _ALL_RUNTIME_ENV_KEYS = [
     "SUB2API_OPENAI_WS_MODE",
     "SUB2API_OPENAI_PASSTHROUGH",
     "SUB2API_OVERWRITE_ACCOUNT_SETTINGS",
+    "EASYPROXY_ENABLED",
+    "EASYPROXY_MANAGEMENT_URL",
+    "EASYPROXY_PASSWORD",
+    "EASYPROXY_PROXY_HOST",
+    "EASYPROXY_POOL_PORT",
+    "EASYPROXY_PORT_MIN",
+    "EASYPROXY_PORT_MAX",
+    "EASYPROXY_COOLDOWN_MINUTES",
+    "EASYPROXY_MASTER_MODE",
     "EMAIL_POLL_INTERVAL",
     "EMAIL_POLL_TIMEOUT",
     "API_KEY",
@@ -247,6 +276,7 @@ def _format_mail_service_missing_fields(missing: list[str]) -> str:
         "email": "email",
         "password": "password",
         "admin_password": "admin_password",
+        "api_key": "api_key",
         "domain": "domain",
     }
     return "、".join(prompt_map.get(field, field) for field in missing)
@@ -453,6 +483,8 @@ def _reload_runtime_config_modules():
     for module_name in (
         "autoteam.cloudmail",
         "autoteam.cloudflare_temp_email",
+        "autoteam.tempmail",
+        "autoteam.easyproxy",
         "autoteam.mail_provider",
         "autoteam.cpa_sync",
         "autoteam.sub2api_sync",
@@ -636,6 +668,11 @@ def _validate_runtime_optional_values(values: dict[str, str]):
     _normalize_bool("SUB2API_AUTO_PAUSE_ON_EXPIRED")
     _normalize_bool("SUB2API_OPENAI_PASSTHROUGH")
     _normalize_bool("SUB2API_OVERWRITE_ACCOUNT_SETTINGS")
+    _normalize_bool("EASYPROXY_ENABLED")
+    _normalize_positive_int("EASYPROXY_POOL_PORT")
+    _normalize_positive_int("EASYPROXY_PORT_MIN")
+    _normalize_positive_int("EASYPROXY_PORT_MAX")
+    _normalize_positive_int("EASYPROXY_COOLDOWN_MINUTES")
 
     ws_mode = str(normalized.get("SUB2API_OPENAI_WS_MODE", "") or "").strip().lower()
     if ws_mode:
@@ -643,11 +680,29 @@ def _validate_runtime_optional_values(values: dict[str, str]):
             raise ValueError("SUB2API_OPENAI_WS_MODE 必须是 off、ctx_pool 或 passthrough")
         normalized["SUB2API_OPENAI_WS_MODE"] = ws_mode
 
+    easyproxy_mode = str(normalized.get("EASYPROXY_MASTER_MODE", "") or "").strip().lower()
+    if easyproxy_mode:
+        if easyproxy_mode not in {"direct", "follow_pool"}:
+            raise ValueError("EASYPROXY_MASTER_MODE 必须是 direct 或 follow_pool")
+        normalized["EASYPROXY_MASTER_MODE"] = easyproxy_mode
+
+    easyproxy_host = str(normalized.get("EASYPROXY_PROXY_HOST", "") or "").strip()
+    if easyproxy_host and any(ch.isspace() for ch in easyproxy_host):
+        raise ValueError("EASYPROXY_PROXY_HOST 不能包含空白字符")
+    normalized["EASYPROXY_PROXY_HOST"] = easyproxy_host
+
     whitelist = str(normalized.get("SUB2API_MODEL_WHITELIST", "") or "").strip()
     if whitelist:
         normalized["SUB2API_MODEL_WHITELIST"] = ",".join(part.strip() for part in whitelist.split(",") if part.strip())
     else:
         normalized["SUB2API_MODEL_WHITELIST"] = ""
+
+    if (
+        normalized.get("EASYPROXY_PORT_MIN")
+        and normalized.get("EASYPROXY_PORT_MAX")
+        and int(normalized["EASYPROXY_PORT_MIN"]) > int(normalized["EASYPROXY_PORT_MAX"])
+    ):
+        raise ValueError("EASYPROXY_PORT_MIN 不能大于 EASYPROXY_PORT_MAX")
 
     return normalized
 
@@ -761,6 +816,9 @@ def _verify_runtime_integrations(
         "CF_TEMP_EMAIL_BASE_URL",
         "CF_TEMP_EMAIL_ADMIN_PASSWORD",
         "CF_TEMP_EMAIL_DOMAIN",
+        "TEMPMAIL_BASE_URL",
+        "TEMPMAIL_API_KEY",
+        "TEMPMAIL_DOMAIN",
     )
     cpa_keys = ("SYNC_TARGET_CPA", "CPA_URL", "CPA_KEY")
     sub2api_keys = ("SYNC_TARGET_SUB2API", "SUB2API_URL", "SUB2API_EMAIL", "SUB2API_PASSWORD")
@@ -869,6 +927,9 @@ def _save_runtime_config(data: dict[str, str]):
             merged["CF_TEMP_EMAIL_BASE_URL"] = ""
             merged["CF_TEMP_EMAIL_ADMIN_PASSWORD"] = ""
             merged["CF_TEMP_EMAIL_DOMAIN"] = ""
+            merged["TEMPMAIL_BASE_URL"] = ""
+            merged["TEMPMAIL_API_KEY"] = ""
+            merged["TEMPMAIL_DOMAIN"] = ""
     else:
         merged["MAIL_PROVIDER"] = normalize_mail_provider(merged.get("MAIL_PROVIDER") or existing.get("MAIL_PROVIDER"))
 
@@ -912,6 +973,11 @@ def _save_runtime_config(data: dict[str, str]):
         raise
 
 
+class EasyProxyReleaseParams(BaseModel):
+    ports: list[int] | None = None
+    remote: bool = True
+
+
 @app.get("/api/setup/status")
 def get_setup_status():
     """检查配置是否完整"""
@@ -943,6 +1009,23 @@ def get_runtime_config_source():
 def put_runtime_config(config: SetupConfig):
     """登录后修改 CloudMail / CPA / Sub2API / 代理等运行时配置。"""
     return _save_runtime_config(config.model_dump(exclude_unset=True))
+
+
+@app.get("/api/easyproxy/status")
+def get_easyproxy_status():
+    from autoteam import easyproxy
+
+    return easyproxy.get_status(env=os.environ)
+
+
+@app.post("/api/easyproxy/release")
+def post_easyproxy_release(params: EasyProxyReleaseParams):
+    from autoteam import easyproxy
+
+    try:
+        return easyproxy.release_ports(params.ports, remote=bool(params.remote), env=os.environ)
+    except easyproxy.EasyProxyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.put("/api/config/source")
@@ -3252,9 +3335,9 @@ def _auto_check_loop():
 
 class AutoCheckConfig(BaseModel):
     interval: int = 300  # 巡检间隔（秒）
-    target_seats: int = 5  # 自动巡检目标 Team seat 数
+    target_seats: int = 2  # 自动巡检目标 Team seat 数
     threshold: int = 10  # 额度阈值（%）
-    min_low: int = 2  # 触发轮转的最少账号数
+    min_low: int = 1  # 触发轮转的最少账号数
     retry_add_phone: bool = True  # 是否自动重试 add_phone
     add_phone_max_retries: int = 3  # add_phone 最大自动重试次数
 

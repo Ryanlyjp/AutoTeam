@@ -110,7 +110,7 @@
             <div>
               <div class="text-sm font-medium text-white">邮箱服务列表</div>
               <div class="mt-1 text-xs leading-5 text-slate-400">
-                可以同时添加多个 CloudMail / Cloudflare Temp Email 实例；默认服务用于新建账号，已有账号会优先复用自身绑定或唯一域名匹配到的服务。
+                可以同时添加多个 CloudMail / Cloudflare Temp Email / Tempmail 实例；默认服务用于新建账号，已有账号会优先复用自身绑定或唯一域名匹配到的服务。
               </div>
             </div>
             <div class="status-badge text-xs text-slate-400">
@@ -124,6 +124,9 @@
             </button>
             <button class="btn-secondary" @click="addMailService('cloudflare_temp_email')">
               + 添加 Cloudflare Temp Email
+            </button>
+            <button class="btn-secondary" @click="addMailService('tempmail')">
+              + 添加 Tempmail
             </button>
           </div>
         </div>
@@ -388,18 +391,195 @@
             <span class="text-xs text-slate-400">{{ proxyExpanded ? '收起' : '展开' }}</span>
           </button>
 
-          <div v-if="proxyExpanded" class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <div v-for="field in proxyFields" :key="field.key" class="rounded-2xl border border-white/10 bg-slate-950/25 p-4">
-              <label class="mb-2 block text-sm font-medium text-slate-300">
-                {{ field.prompt }}
-                <span v-if="isRuntimeRequired(field)" class="text-red-400">*</span>
-              </label>
-              <input
-                v-model="runtimeForm[field.key]"
-                :type="fieldInputType(field.key)"
-                :placeholder="field.default || ''"
-                class="input-dark"
-              />
+          <div v-if="proxyExpanded" class="mt-4 space-y-5">
+            <div class="rounded-2xl border border-white/10 bg-white/5 p-5">
+              <div class="mb-4">
+                <div class="text-sm font-medium text-white">EasyProxy 接管</div>
+                <div class="mt-1 text-xs leading-5 text-slate-400">
+                  启用后，AutoTeam 会优先按 `EASYPROXY_MASTER_MODE` 决定浏览器和 HTTP 流量是否走 EasyProxy 池化端口；`follow_pool` 表示走 `proxy_host:pool_port`，`direct` 表示直连。
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                <div v-for="field in easyproxyFields" :key="field.key" class="rounded-2xl border border-white/10 bg-slate-950/25 p-4">
+                  <label class="mb-2 block text-sm font-medium text-slate-300">
+                    {{ field.prompt }}
+                    <span v-if="isRuntimeRequired(field)" class="text-red-400">*</span>
+                  </label>
+                  <select
+                    v-if="isEasyproxyEnabledField(field.key)"
+                    v-model="runtimeForm[field.key]"
+                    class="input-dark"
+                  >
+                    <option value="true">启用</option>
+                    <option value="false">关闭</option>
+                  </select>
+                  <select
+                    v-else-if="isEasyproxyMasterModeField(field.key)"
+                    v-model="runtimeForm[field.key]"
+                    class="input-dark"
+                  >
+                    <option value="direct">direct</option>
+                    <option value="follow_pool">follow_pool</option>
+                  </select>
+                  <input
+                    v-else
+                    v-model="runtimeForm[field.key]"
+                    :type="fieldInputType(field.key)"
+                    :step="fieldInputStep(field.key)"
+                    :placeholder="field.default || ''"
+                    class="input-dark"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-2xl border border-white/10 bg-white/5 p-5">
+              <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                  <div class="text-sm font-medium text-white">EasyProxy 状态 / 端口管理</div>
+                  <div class="mt-1 text-xs leading-5 text-slate-400">
+                    读取 EasyProxy 管理 API 的真实 hybrid 端口列表，并叠加本地冷却黑名单。浏览器启动时会从“可选”端口里真随机挑选，不再固定从 `24001` 开始试。
+                  </div>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    class="btn-secondary"
+                    :disabled="easyproxyLoading"
+                    @click="probeEasyProxy"
+                  >
+                    {{ easyproxyLoading ? '刷新中...' : '刷新状态' }}
+                  </button>
+                  <button
+                    class="btn-secondary"
+                    :disabled="easyproxyReleasing || !(easyproxySummary?.local_blacklisted > 0)"
+                    @click="releaseEasyProxy()"
+                  >
+                    {{ easyproxyReleasing ? '释放中...' : '释放全部本地黑名单' }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="mt-4 flex flex-wrap gap-2 text-xs">
+                <span class="status-badge text-slate-300">
+                  {{ easyproxyEnabled ? 'EasyProxy 已启用' : 'EasyProxy 未启用' }}
+                </span>
+                <span v-if="easyproxyStatus?.ok" class="status-badge border-emerald-400/20 bg-emerald-500/10 text-emerald-200">
+                  可选 {{ easyproxySummary?.selectable ?? 0 }} / {{ easyproxySummary?.total ?? 0 }}
+                </span>
+                <span v-if="easyproxyStatus?.ok" class="status-badge text-slate-300">
+                  远端可用 {{ easyproxySummary?.remote_available ?? 0 }}
+                </span>
+                <span v-if="easyproxyStatus?.ok" class="status-badge text-slate-300">
+                  本地黑名单 {{ easyproxySummary?.local_blacklisted ?? 0 }}
+                </span>
+                <span class="status-badge text-slate-300">
+                  Master {{ String(runtimeForm.EASYPROXY_MASTER_MODE || 'direct') === 'follow_pool' ? '走池端口' : '直连' }}
+                </span>
+              </div>
+
+              <p class="mt-3 text-xs leading-5 text-slate-500">
+                说明：这里按管理 API 返回的真实端口筛选 `EASYPROXY_PORT_MIN ~ EASYPROXY_PORT_MAX`，不会假设端口一定连续，也不会优先固定选最小端口。
+              </p>
+
+              <div v-if="easyproxyStatus?.error" class="mt-4 rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+                {{ easyproxyStatus.error }}
+              </div>
+
+              <div v-if="easyproxyStatus?.ok" class="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-slate-950/25">
+                <div class="overflow-x-auto">
+                  <table class="min-w-full text-sm">
+                    <thead class="border-b border-white/10 bg-white/5 text-slate-300">
+                      <tr>
+                        <th class="px-4 py-3 text-left font-medium">端口</th>
+                        <th class="px-4 py-3 text-left font-medium">标签</th>
+                        <th class="px-4 py-3 text-left font-medium">状态</th>
+                        <th class="px-4 py-3 text-left font-medium">说明</th>
+                        <th class="px-4 py-3 text-left font-medium">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="entry in easyproxyPorts"
+                        :key="entry.port"
+                        class="border-b border-white/5 last:border-b-0"
+                      >
+                        <td class="px-4 py-3 font-mono text-slate-200">{{ entry.port }}</td>
+                        <td class="px-4 py-3 text-slate-300">{{ entry.tag || entry.name || '-' }}</td>
+                        <td class="px-4 py-3">
+                          <span
+                            v-if="entry.selectable"
+                            class="status-badge border-emerald-400/20 bg-emerald-500/10 text-emerald-200"
+                          >
+                            可选
+                          </span>
+                          <span
+                            v-else-if="entry.local_blacklisted"
+                            class="status-badge border-amber-400/20 bg-amber-500/10 text-amber-200"
+                          >
+                            本地拉黑
+                          </span>
+                          <span
+                            v-else-if="entry.remote_blacklisted"
+                            class="status-badge border-amber-400/20 bg-amber-500/10 text-amber-200"
+                          >
+                            远端拉黑
+                          </span>
+                          <span v-else class="status-badge text-slate-300">
+                            {{ entry.available ? '占用 / 不可选' : '不可用' }}
+                          </span>
+                        </td>
+                        <td
+                          class="max-w-xl px-4 py-3 text-xs leading-5 text-slate-400"
+                          :title="entry.local_blacklist_reason || entry.last_error || ''"
+                        >
+                          {{ entry.local_blacklist_reason || entry.last_error || '-' }}
+                        </td>
+                        <td class="px-4 py-3">
+                          <button
+                            v-if="entry.local_blacklisted || entry.remote_blacklisted"
+                            class="text-xs text-cyan-300 underline decoration-cyan-400/40 underline-offset-4 hover:text-cyan-200 disabled:cursor-not-allowed disabled:text-slate-500"
+                            :disabled="easyproxyReleasing"
+                            @click="releaseEasyProxy([entry.port])"
+                          >
+                            释放
+                          </button>
+                          <span v-else class="text-xs text-slate-500">-</span>
+                        </td>
+                      </tr>
+                      <tr v-if="!easyproxyPorts.length">
+                        <td colspan="5" class="px-4 py-4 text-center text-slate-500">
+                          当前范围内没有可展示的 hybrid 端口
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div class="rounded-2xl border border-white/10 bg-white/5 p-5">
+              <div class="mb-4">
+                <div class="text-sm font-medium text-white">手动 Playwright 代理</div>
+                <div class="mt-1 text-xs leading-5 text-slate-400">
+                  只在没有启用 EasyProxy，或者你明确想走单一固定代理时填写。启用 EasyProxy 后，这里的代理 URL 会被接管逻辑覆盖。
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                <div v-for="field in manualProxyFields" :key="field.key" class="rounded-2xl border border-white/10 bg-slate-950/25 p-4">
+                  <label class="mb-2 block text-sm font-medium text-slate-300">
+                    {{ field.prompt }}
+                    <span v-if="isRuntimeRequired(field)" class="text-red-400">*</span>
+                  </label>
+                  <input
+                    v-model="runtimeForm[field.key]"
+                    :type="fieldInputType(field.key)"
+                    :placeholder="field.default || ''"
+                    class="input-dark"
+                  />
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -545,7 +725,7 @@ defineProps({
 const emit = defineEmits(['refresh', 'admin-progress'])
 
 const runtimeCategoryKeys = {
-  cloudmail: ['MAIL_PROVIDER', 'CLOUDMAIL_BASE_URL', 'CLOUDMAIL_EMAIL', 'CLOUDMAIL_PASSWORD', 'CLOUDMAIL_DOMAIN', 'CF_TEMP_EMAIL_BASE_URL', 'CF_TEMP_EMAIL_ADMIN_PASSWORD', 'CF_TEMP_EMAIL_DOMAIN'],
+  cloudmail: ['MAIL_PROVIDER', 'CLOUDMAIL_BASE_URL', 'CLOUDMAIL_EMAIL', 'CLOUDMAIL_PASSWORD', 'CLOUDMAIL_DOMAIN', 'CF_TEMP_EMAIL_BASE_URL', 'CF_TEMP_EMAIL_ADMIN_PASSWORD', 'CF_TEMP_EMAIL_DOMAIN', 'TEMPMAIL_BASE_URL', 'TEMPMAIL_API_KEY', 'TEMPMAIL_DOMAIN'],
   sync: [
     'SYNC_TARGET_CPA',
     'SYNC_TARGET_SUB2API',
@@ -565,7 +745,19 @@ const runtimeCategoryKeys = {
     'SUB2API_OVERWRITE_ACCOUNT_SETTINGS',
     'SUB2API_PROXY',
   ],
-  proxy: ['PLAYWRIGHT_PROXY_URL', 'PLAYWRIGHT_PROXY_BYPASS'],
+  proxy: [
+    'EASYPROXY_ENABLED',
+    'EASYPROXY_MANAGEMENT_URL',
+    'EASYPROXY_PASSWORD',
+    'EASYPROXY_PROXY_HOST',
+    'EASYPROXY_POOL_PORT',
+    'EASYPROXY_PORT_MIN',
+    'EASYPROXY_PORT_MAX',
+    'EASYPROXY_COOLDOWN_MINUTES',
+    'EASYPROXY_MASTER_MODE',
+    'PLAYWRIGHT_PROXY_URL',
+    'PLAYWRIGHT_PROXY_BYPASS',
+  ],
   security: ['API_KEY'],
 }
 
@@ -574,7 +766,7 @@ const runtimeCategoryMeta = {
     icon: '📧',
     badge: 'Mail Services',
     title: '邮箱服务配置',
-    description: '配置自动注册和收验证码所需的邮箱后端。现在支持同时维护多个 CloudMail / Cloudflare Temp Email 实例，并指定默认新建服务。',
+    description: '配置自动注册和收验证码所需的邮箱后端。现在支持同时维护多个 CloudMail / Cloudflare Temp Email / Tempmail 实例，并指定默认新建服务。',
     note: '已有账号会优先按账号自身保存的 mail_service_id 或唯一邮箱域名匹配服务；存在歧义时不会盲猜。',
     footer: '邮箱服务配置保存后会立即热加载；之后的新建、复用和验证码轮询都会按最新服务列表执行。',
   },
@@ -589,8 +781,8 @@ const runtimeCategoryMeta = {
     icon: '🛰️',
     badge: 'Proxy / Advanced',
     title: '代理 / 高级',
-    description: '用于单独配置 Playwright 浏览器流量代理。属于低频项，默认折叠，避免把主配置界面堆得过满。',
-    note: '只有在代理 ChatGPT / Auth 页面访问时才建议配置；本地回调场景通常还需要设置 bypass。',
+    description: '用于配置 EasyProxy 接管逻辑，或手动指定 Playwright 浏览器代理。属于低频项，默认折叠，避免把主配置界面堆得过满。',
+    note: '启用 EasyProxy 后，代理接管优先级高于手动 Playwright 代理；本地回调场景通常还需要设置 bypass。',
   },
   security: {
     icon: '🔐',
@@ -624,6 +816,8 @@ const runtimeSaving = ref(false)
 const runtimeSaved = ref(false)
 const runtimeMessage = ref('')
 const runtimeMessageClass = ref('')
+const easyproxyStatus = ref(null)
+const easyproxyReleasing = ref(false)
 
 const sourcePath = ref('')
 const sourceContent = ref('')
@@ -693,9 +887,30 @@ const mailServiceFieldMeta = {
     {
       key: 'domain',
       label: '邮箱域名',
+      required: false,
+      placeholder: '可留空，例如 mail.example.com',
+      hint: '可留空；留空时由 tempmail 后端随机分配域名。若填写则可用于自动匹配已有账号所属邮箱服务',
+    },
+  ],
+  tempmail: [
+    {
+      key: 'base_url',
+      label: 'Tempmail API 地址',
       required: true,
-      placeholder: 'mail.example.com',
-      hint: '用于自动匹配已有账号所属邮箱服务',
+      placeholder: 'https://tempmail-api.example.com',
+    },
+    {
+      key: 'api_key',
+      label: 'API Key',
+      required: true,
+      inputType: 'password',
+    },
+    {
+      key: 'domain',
+      label: '邮箱域名',
+      required: false,
+      placeholder: '可留空，例如 mail.example.com',
+      hint: '可留空；留空时由 tempmail 后端随机分配域名。若填写则可用于自动匹配已有账号所属邮箱服务',
     },
   ],
 }
@@ -719,11 +934,28 @@ function fieldsByKeys(keys) {
 
 const securityFields = computed(() => fieldsByKeys(runtimeCategoryKeys.security))
 const proxyFields = computed(() => fieldsByKeys(runtimeCategoryKeys.proxy))
+const easyproxyFields = computed(() => fieldsByKeys([
+  'EASYPROXY_ENABLED',
+  'EASYPROXY_MANAGEMENT_URL',
+  'EASYPROXY_PASSWORD',
+  'EASYPROXY_PROXY_HOST',
+  'EASYPROXY_POOL_PORT',
+  'EASYPROXY_PORT_MIN',
+  'EASYPROXY_PORT_MAX',
+  'EASYPROXY_COOLDOWN_MINUTES',
+  'EASYPROXY_MASTER_MODE',
+]))
+const manualProxyFields = computed(() => fieldsByKeys(['PLAYWRIGHT_PROXY_URL', 'PLAYWRIGHT_PROXY_BYPASS']))
 const syncToggleFields = computed(() => fieldsByKeys(['SYNC_TARGET_CPA', 'SYNC_TARGET_SUB2API']))
 const defaultMailService = computed(() => mailServices.value.find(service => service.id === mailServiceDefault.value) || null)
 
 const syncCpaEnabled = computed(() => String(runtimeForm.SYNC_TARGET_CPA || '').toLowerCase() === 'true')
 const syncSub2apiEnabled = computed(() => String(runtimeForm.SYNC_TARGET_SUB2API || '').toLowerCase() === 'true')
+const easyproxyEnabled = computed(() => String(runtimeForm.EASYPROXY_ENABLED || '').toLowerCase() === 'true')
+const manualProxyConfigured = computed(() => Boolean(String(runtimeForm.PLAYWRIGHT_PROXY_URL || '').trim()))
+const easyproxyLoading = computed(() => Boolean(easyproxyStatus.value?.running))
+const easyproxyPorts = computed(() => Array.isArray(easyproxyStatus.value?.ports) ? easyproxyStatus.value.ports : [])
+const easyproxySummary = computed(() => easyproxyStatus.value?.summary || null)
 const syncCpaFields = computed(() => syncCpaEnabled.value ? fieldsByKeys(['CPA_URL', 'CPA_KEY']) : [])
 const syncSub2apiConnectionFields = computed(() => syncSub2apiEnabled.value
   ? fieldsByKeys(['SUB2API_URL', 'SUB2API_EMAIL', 'SUB2API_PASSWORD', 'SUB2API_GROUP'])
@@ -791,15 +1023,20 @@ const currentRuntimeStatus = computed(() => {
   }
 
   if (selectedRuntimeCategory.value === 'proxy') {
-    return proxyFields.value.some(field => field.configured)
+    return easyproxyEnabled.value
       ? {
-          label: '已设置',
+          label: 'EasyProxy',
           class: 'border-emerald-400/20 bg-emerald-500/10 text-emerald-200',
         }
-      : {
-          label: '未设置',
-          class: 'border-white/10 bg-white/5 text-slate-400',
-        }
+      : manualProxyConfigured.value
+        ? {
+            label: '已设置',
+            class: 'border-emerald-400/20 bg-emerald-500/10 text-emerald-200',
+          }
+        : {
+            label: '未设置',
+            class: 'border-white/10 bg-white/5 text-slate-400',
+          }
   }
 
   if (selectedRuntimeCategory.value === 'cloudmail') {
@@ -864,7 +1101,15 @@ function setSourceMessage(text, type = 'success') {
 }
 
 function fieldInputType(key) {
-  if (['SUB2API_CONCURRENCY', 'SUB2API_PRIORITY', 'SUB2API_RATE_MULTIPLIER'].includes(key)) {
+  if ([
+    'SUB2API_CONCURRENCY',
+    'SUB2API_PRIORITY',
+    'SUB2API_RATE_MULTIPLIER',
+    'EASYPROXY_POOL_PORT',
+    'EASYPROXY_PORT_MIN',
+    'EASYPROXY_PORT_MAX',
+    'EASYPROXY_COOLDOWN_MINUTES',
+  ].includes(key)) {
     return 'number'
   }
   return key.includes('PASSWORD') || key.includes('KEY') ? 'password' : 'text'
@@ -879,6 +1124,7 @@ function isBooleanStringField(key) {
     'SUB2API_AUTO_PAUSE_ON_EXPIRED',
     'SUB2API_OPENAI_PASSTHROUGH',
     'SUB2API_OVERWRITE_ACCOUNT_SETTINGS',
+    'EASYPROXY_ENABLED',
   ].includes(key)
 }
 
@@ -886,20 +1132,38 @@ function isWsModeField(key) {
   return key === 'SUB2API_OPENAI_WS_MODE'
 }
 
+function isEasyproxyEnabledField(key) {
+  return key === 'EASYPROXY_ENABLED'
+}
+
+function isEasyproxyMasterModeField(key) {
+  return key === 'EASYPROXY_MASTER_MODE'
+}
+
 function fieldInputStep(key) {
   if (key === 'SUB2API_RATE_MULTIPLIER') {
     return '0.001'
   }
-  if (key === 'SUB2API_CONCURRENCY' || key === 'SUB2API_PRIORITY') {
+  if (
+    key === 'SUB2API_CONCURRENCY'
+    || key === 'SUB2API_PRIORITY'
+    || key === 'EASYPROXY_POOL_PORT'
+    || key === 'EASYPROXY_PORT_MIN'
+    || key === 'EASYPROXY_PORT_MAX'
+    || key === 'EASYPROXY_COOLDOWN_MINUTES'
+  ) {
     return '1'
   }
   return undefined
 }
 
 function createMailService(type = 'cloudmail') {
-  const normalizedType = String(type || '').toLowerCase() === 'cloudflare_temp_email'
+  const typeText = String(type || '').toLowerCase()
+  const normalizedType = typeText === 'cloudflare_temp_email'
     ? 'cloudflare_temp_email'
-    : 'cloudmail'
+    : typeText === 'tempmail'
+      ? 'tempmail'
+      : 'cloudmail'
   const randomPart = Math.random().toString(36).slice(2, 8)
   return {
     id: `mailsvc-${Date.now().toString(36)}-${randomPart}`,
@@ -910,6 +1174,7 @@ function createMailService(type = 'cloudmail') {
     email: '',
     password: '',
     admin_password: '',
+    api_key: '',
   }
 }
 
@@ -924,6 +1189,7 @@ function normalizeMailService(service) {
     email: String(service?.email || ''),
     password: String(service?.password || ''),
     admin_password: String(service?.admin_password || ''),
+    api_key: String(service?.api_key || ''),
   }
 }
 
@@ -933,20 +1199,34 @@ function sanitizeMailService(service) {
   if (normalized.type === 'cloudflare_temp_email') {
     delete normalized.email
     delete normalized.password
+    delete normalized.api_key
+  } else if (normalized.type === 'tempmail') {
+    delete normalized.email
+    delete normalized.password
+    delete normalized.admin_password
   } else {
     delete normalized.admin_password
+    delete normalized.api_key
   }
   return normalized
 }
 
 function mailServiceTypeLabel(type) {
-  return type === 'cloudflare_temp_email' ? 'Cloudflare Temp Email' : 'CloudMail'
+  if (type === 'cloudflare_temp_email') {
+    return 'Cloudflare Temp Email'
+  }
+  if (type === 'tempmail') {
+    return 'Tempmail'
+  }
+  return 'CloudMail'
 }
 
 function mailServiceDescription(type) {
   return type === 'cloudflare_temp_email'
     ? '填写管理端 API 地址、管理员密码和对应邮箱域名。'
-    : '填写 CloudMail API 地址、管理员账号密码和对应邮箱域名。'
+    : type === 'tempmail'
+      ? '填写自建 tempmail 后端 API 地址和 API Key；邮箱域名可留空，交给后端随机分配。'
+      : '填写 CloudMail API 地址、管理员账号密码和对应邮箱域名。'
 }
 
 function mailServiceFields(service) {
@@ -1007,6 +1287,10 @@ function normalizeRuntimeFieldValue(field) {
     const mode = String(value || '').toLowerCase()
     return ['off', 'ctx_pool', 'passthrough'].includes(mode) ? mode : 'off'
   }
+  if (isEasyproxyMasterModeField(field?.key)) {
+    const mode = String(value || '').toLowerCase()
+    return ['direct', 'follow_pool'].includes(mode) ? mode : 'direct'
+  }
   return value
 }
 
@@ -1062,11 +1346,39 @@ async function saveRuntimeConfig() {
       runtimeSaved.value = false
     }, 3000)
     await loadRuntimeConfig()
+    if (selectedRuntimeCategory.value === 'proxy') {
+      if (easyproxyEnabled.value) {
+        await probeEasyProxy()
+      } else {
+        easyproxyStatus.value = null
+      }
+    }
     emit('refresh')
   } catch (e) {
     setRuntimeMessage(e.message, 'error')
   } finally {
     runtimeSaving.value = false
+  }
+}
+
+async function probeEasyProxy() {
+  easyproxyStatus.value = { running: true }
+  try {
+    easyproxyStatus.value = await api.easyproxyStatus()
+  } catch (e) {
+    easyproxyStatus.value = { ok: false, error: e.message }
+  }
+}
+
+async function releaseEasyProxy(ports = null) {
+  easyproxyReleasing.value = true
+  try {
+    easyproxyStatus.value = await api.easyproxyRelease({ ports, remote: true })
+    setRuntimeMessage('EasyProxy 端口状态已更新')
+  } catch (e) {
+    setRuntimeMessage(`释放端口失败: ${e.message}`, 'error')
+  } finally {
+    easyproxyReleasing.value = false
   }
 }
 
@@ -1105,6 +1417,14 @@ async function saveSourceConfig() {
 watch(visualCategory, async (next) => {
   if (next === 'source' && !sourceLoaded.value) {
     await loadSourceConfig()
+    return
+  }
+  if (next === 'proxy') {
+    if (easyproxyEnabled.value) {
+      await probeEasyProxy()
+    } else {
+      easyproxyStatus.value = null
+    }
   }
 })
 

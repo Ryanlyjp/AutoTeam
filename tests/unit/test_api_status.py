@@ -419,6 +419,94 @@ def test_get_runtime_config_switches_required_mail_fields_by_provider(tmp_path, 
     assert fields["CLOUDMAIL_EMAIL"]["runtime_required"] is False
 
 
+def test_get_runtime_config_switches_required_mail_fields_to_tempmail(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "MAIL_PROVIDER=tempmail",
+                "TEMPMAIL_BASE_URL=https://tempmail-api.example.com",
+                "TEMPMAIL_API_KEY=secret-key",
+                "API_KEY=runtime-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("autoteam.setup_wizard.ENV_FILE", env_file)
+    for key in (
+        "MAIL_PROVIDER",
+        "TEMPMAIL_BASE_URL",
+        "TEMPMAIL_API_KEY",
+        "TEMPMAIL_DOMAIN",
+        "CLOUDMAIL_BASE_URL",
+        "CLOUDMAIL_EMAIL",
+        "CLOUDMAIL_PASSWORD",
+        "CLOUDMAIL_DOMAIN",
+        "CF_TEMP_EMAIL_BASE_URL",
+        "CF_TEMP_EMAIL_ADMIN_PASSWORD",
+        "CF_TEMP_EMAIL_DOMAIN",
+        "API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    result = api.get_runtime_config()
+    fields = {field["key"]: field for field in result["fields"]}
+
+    assert result["configured"] is True
+    assert fields["MAIL_PROVIDER"]["value"] == "tempmail"
+    assert fields["TEMPMAIL_BASE_URL"]["runtime_required"] is True
+    assert fields["TEMPMAIL_API_KEY"]["runtime_required"] is True
+    assert fields["TEMPMAIL_DOMAIN"]["runtime_required"] is False
+    assert fields["CLOUDMAIL_BASE_URL"]["runtime_required"] is False
+    assert fields["CF_TEMP_EMAIL_BASE_URL"]["runtime_required"] is False
+
+
+def test_get_runtime_config_reads_easyproxy_fields(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "EASYPROXY_ENABLED=true",
+                "EASYPROXY_MANAGEMENT_URL=http://127.0.0.1:9888",
+                "EASYPROXY_PASSWORD=secret",
+                "EASYPROXY_PROXY_HOST=127.0.0.1",
+                "EASYPROXY_POOL_PORT=2323",
+                "EASYPROXY_PORT_MIN=24000",
+                "EASYPROXY_PORT_MAX=24100",
+                "EASYPROXY_COOLDOWN_MINUTES=60",
+                "EASYPROXY_MASTER_MODE=follow_pool",
+                "API_KEY=runtime-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("autoteam.setup_wizard.ENV_FILE", env_file)
+    for key in (
+        "EASYPROXY_ENABLED",
+        "EASYPROXY_MANAGEMENT_URL",
+        "EASYPROXY_PASSWORD",
+        "EASYPROXY_PROXY_HOST",
+        "EASYPROXY_POOL_PORT",
+        "EASYPROXY_PORT_MIN",
+        "EASYPROXY_PORT_MAX",
+        "EASYPROXY_COOLDOWN_MINUTES",
+        "EASYPROXY_MASTER_MODE",
+        "API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    result = api.get_runtime_config()
+    fields = {field["key"]: field for field in result["fields"]}
+
+    assert fields["EASYPROXY_ENABLED"]["value"] == "true"
+    assert fields["EASYPROXY_MANAGEMENT_URL"]["value"] == "http://127.0.0.1:9888"
+    assert fields["EASYPROXY_PROXY_HOST"]["value"] == "127.0.0.1"
+    assert fields["EASYPROXY_POOL_PORT"]["value"] == "2323"
+    assert fields["EASYPROXY_MASTER_MODE"]["value"] == "follow_pool"
+
+
 def test_get_runtime_config_exposes_structured_mail_services(tmp_path, monkeypatch):
     services = [
         {

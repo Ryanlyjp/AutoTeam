@@ -18,7 +18,7 @@ from autoteam.admin_state import (
     update_admin_state,
 )
 from autoteam.chatgpt_transport import build_chatgpt_transport
-from autoteam.config import get_playwright_launch_options
+from autoteam.config import clear_last_easyproxy_assignment, get_playwright_launch_options, mark_last_easyproxy_assignment_bad
 from autoteam.textio import read_text
 
 logger = logging.getLogger(__name__)
@@ -166,12 +166,14 @@ class ChatGPTTeamAPI:
         try:
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.launch(**get_playwright_launch_options())
+            clear_last_easyproxy_assignment()
             self.context = self.browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
             )
             self.page = self.context.new_page()
-        except Exception:
+        except Exception as exc:
+            mark_last_easyproxy_assignment_bad(str(exc))
             self.stop()
             raise
 

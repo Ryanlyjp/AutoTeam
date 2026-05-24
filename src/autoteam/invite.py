@@ -24,7 +24,7 @@ import time
 from playwright.sync_api import sync_playwright
 
 from autoteam.chatgpt_api import ChatGPTTeamAPI
-from autoteam.config import get_playwright_launch_options
+from autoteam.config import clear_last_easyproxy_assignment, get_playwright_launch_options, mark_last_easyproxy_assignment_bad
 from autoteam.mail_provider import get_mail_client as CloudMailClient
 from autoteam.signup_profile import SignupProfile, generate_signup_profile
 
@@ -247,26 +247,30 @@ def register_with_invite(
     logger.info("[注册] 等待 ChatGPT 发送验证码到 %s...", email)
     verification_code = None
     try:
-        # 搜索来自 OpenAI 的验证码邮件（不是邀请邮件）
-        start = time.time()
-        while time.time() - start < MAIL_TIMEOUT:
-            emails = mail_client.search_emails_by_recipient(email, size=10)
-            for em in emails:
-                subject = em.get("subject", "").lower()
-                sender = em.get("sendEmail", "").lower()
-                # 跳过邀请邮件，只要验证码邮件
-                if "invited" in subject or "invitation" in subject:
-                    continue
-                if "openai" in sender or "chatgpt" in sender:
-                    verification_code = mail_client.extract_verification_code(em)
-                    if verification_code:
-                        logger.info("[CloudMail] 收到验证码: %s", verification_code)
-                        break
-            if verification_code:
-                break
-            elapsed = int(time.time() - start)
-            print(f"\r[CloudMail] 等待验证码... ({elapsed}s)", end="", flush=True)
-            time.sleep(3)
+        if getattr(mail_client, "provider_name", "") == "tempmail" and hasattr(mail_client, "wait_for_otp"):
+            verification_code = mail_client.wait_for_otp(email, timeout=MAIL_TIMEOUT, sender_keyword="openai")
+            logger.info("[Tempmail] 收到验证码: %s", verification_code)
+        else:
+            # 搜索来自 OpenAI 的验证码邮件（不是邀请邮件）
+            start = time.time()
+            while time.time() - start < MAIL_TIMEOUT:
+                emails = mail_client.search_emails_by_recipient(email, size=10)
+                for em in emails:
+                    subject = em.get("subject", "").lower()
+                    sender = em.get("sendEmail", "").lower()
+                    # 跳过邀请邮件，只要验证码邮件
+                    if "invited" in subject or "invitation" in subject:
+                        continue
+                    if "openai" in sender or "chatgpt" in sender:
+                        verification_code = mail_client.extract_verification_code(em)
+                        if verification_code:
+                            logger.info("[CloudMail] 收到验证码: %s", verification_code)
+                            break
+                if verification_code:
+                    break
+                elapsed = int(time.time() - start)
+                print(f"\r[CloudMail] 等待验证码... ({elapsed}s)", end="", flush=True)
+                time.sleep(3)
     except Exception as e:
         logger.error("[注册] 等待验证码异常: %s", e)
 
@@ -408,7 +412,12 @@ def run():
         logger.info("[邀请] 开始注册 ChatGPT 账号")
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(**get_playwright_launch_options())
+            try:
+                browser = p.chromium.launch(**get_playwright_launch_options())
+                clear_last_easyproxy_assignment()
+            except Exception as exc:
+                mark_last_easyproxy_assignment_bad(str(exc))
+                raise
             context = browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",

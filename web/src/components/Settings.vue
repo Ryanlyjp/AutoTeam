@@ -442,7 +442,7 @@ const props = defineProps({
 
 const emit = defineEmits(['refresh', 'admin-progress'])
 
-const form = ref({ interval: 5, target_seats: 5, threshold: 10, min_low: 2, retry_add_phone: true, add_phone_max_retries: 3 })
+const form = ref({ interval: 5, target_seats: 2, threshold: 10, min_low: 1, retry_add_phone: true, add_phone_max_retries: 3 })
 const saving = ref(false)
 const saved = ref(false)
 
@@ -527,9 +527,9 @@ async function loadAutoCheckConfig() {
     const cfg = await api.getAutoCheckConfig()
     form.value = {
       interval: Math.round(cfg.interval / 60),
-      target_seats: cfg.target_seats ?? 5,
+      target_seats: cfg.target_seats ?? 2,
       threshold: cfg.threshold,
-      min_low: cfg.min_low,
+      min_low: cfg.min_low ?? 1,
       retry_add_phone: cfg.retry_add_phone ?? true,
       add_phone_max_retries: cfg.add_phone_max_retries ?? 3,
     }
@@ -754,9 +754,9 @@ async function save() {
     })
     form.value = {
       interval: Math.round(cfg.interval / 60),
-      target_seats: cfg.target_seats ?? 5,
+      target_seats: cfg.target_seats ?? 2,
       threshold: cfg.threshold,
-      min_low: cfg.min_low,
+      min_low: cfg.min_low ?? 1,
       retry_add_phone: cfg.retry_add_phone ?? true,
       add_phone_max_retries: cfg.add_phone_max_retries ?? 3,
     }

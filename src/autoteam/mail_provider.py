@@ -9,10 +9,12 @@ from typing import Any
 
 MAIL_PROVIDER_CLOUDMAIL = "cloudmail"
 MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL = "cloudflare_temp_email"
+MAIL_PROVIDER_TEMPMAIL = "tempmail"
 
 SUPPORTED_MAIL_PROVIDERS = (
     MAIL_PROVIDER_CLOUDMAIL,
     MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL,
+    MAIL_PROVIDER_TEMPMAIL,
 )
 
 MAIL_SERVICES_JSON_ENV = "MAIL_SERVICES_JSON"
@@ -30,11 +32,16 @@ _MAIL_PROVIDER_REQUIRED_KEYS = {
         "CF_TEMP_EMAIL_ADMIN_PASSWORD",
         "CF_TEMP_EMAIL_DOMAIN",
     ),
+    MAIL_PROVIDER_TEMPMAIL: (
+        "TEMPMAIL_BASE_URL",
+        "TEMPMAIL_API_KEY",
+    ),
 }
 
 _MAIL_SERVICE_REQUIRED_FIELDS = {
     MAIL_PROVIDER_CLOUDMAIL: ("base_url", "email", "password", "domain"),
     MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL: ("base_url", "admin_password", "domain"),
+    MAIL_PROVIDER_TEMPMAIL: ("base_url", "api_key"),
 }
 
 
@@ -66,6 +73,8 @@ def _normalize_service_id(value: object | None, fallback_prefix: str = "mailsvc"
 def _legacy_service_id(provider: str) -> str:
     if provider == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         return "legacy-cloudflare-temp-email"
+    if provider == MAIL_PROVIDER_TEMPMAIL:
+        return "legacy-tempmail"
     return "legacy-cloudmail"
 
 
@@ -73,6 +82,8 @@ def get_mail_provider_prompt(provider: str | None = None) -> str:
     resolved = normalize_mail_provider(provider or get_mail_provider_name())
     if resolved == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         return "Cloudflare Temp Email"
+    if resolved == MAIL_PROVIDER_TEMPMAIL:
+        return "Tempmail"
     return "CloudMail"
 
 
@@ -105,6 +116,15 @@ def _service_dict_from_legacy(
             "base_url": str(source.get("CF_TEMP_EMAIL_BASE_URL", "") or "").strip(),
             "admin_password": str(source.get("CF_TEMP_EMAIL_ADMIN_PASSWORD", "") or "").strip(),
             "domain": _normalize_domain(source.get("CF_TEMP_EMAIL_DOMAIN", "")),
+        }
+    elif provider == MAIL_PROVIDER_TEMPMAIL:
+        service = {
+            "id": _legacy_service_id(provider),
+            "type": provider,
+            "name": "",
+            "base_url": str(source.get("TEMPMAIL_BASE_URL", "") or "").strip(),
+            "api_key": str(source.get("TEMPMAIL_API_KEY", "") or "").strip(),
+            "domain": _normalize_domain(source.get("TEMPMAIL_DOMAIN", "")),
         }
     else:
         service = {
@@ -155,6 +175,8 @@ def normalize_mail_service(service: dict[str, Any] | None, *, fallback_id: str |
     }
     if service_type == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         normalized["admin_password"] = str(service.get("admin_password") or service.get("password") or "").strip()
+    elif service_type == MAIL_PROVIDER_TEMPMAIL:
+        normalized["api_key"] = str(service.get("api_key") or service.get("password") or "").strip()
     else:
         normalized["email"] = str(service.get("email") or "").strip()
         normalized["password"] = str(service.get("password") or "").strip()
@@ -310,6 +332,8 @@ def get_mail_domain(provider: str | None = None, env: dict[str, Any] | None = No
     resolved = normalize_mail_provider(provider or source.get("MAIL_PROVIDER"))
     if resolved == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         return _normalize_domain(source.get("CF_TEMP_EMAIL_DOMAIN", ""))
+    if resolved == MAIL_PROVIDER_TEMPMAIL:
+        return _normalize_domain(source.get("TEMPMAIL_DOMAIN", ""))
     return _normalize_domain(source.get("CLOUDMAIL_DOMAIN", ""))
 
 
@@ -435,12 +459,19 @@ def get_mail_service_legacy_env_values(service: dict[str, Any] | None) -> dict[s
         "CF_TEMP_EMAIL_BASE_URL": "",
         "CF_TEMP_EMAIL_ADMIN_PASSWORD": "",
         "CF_TEMP_EMAIL_DOMAIN": "",
+        "TEMPMAIL_BASE_URL": "",
+        "TEMPMAIL_API_KEY": "",
+        "TEMPMAIL_DOMAIN": "",
     }
     if provider == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         values["CF_TEMP_EMAIL_BASE_URL"] = str(service.get("base_url") or "").strip()
         values["CF_TEMP_EMAIL_ADMIN_PASSWORD"] = str(service.get("admin_password") or "").strip()
         domain = _normalize_domain(service.get("domain"))
         values["CF_TEMP_EMAIL_DOMAIN"] = domain
+    elif provider == MAIL_PROVIDER_TEMPMAIL:
+        values["TEMPMAIL_BASE_URL"] = str(service.get("base_url") or "").strip()
+        values["TEMPMAIL_API_KEY"] = str(service.get("api_key") or "").strip()
+        values["TEMPMAIL_DOMAIN"] = _normalize_domain(service.get("domain"))
     elif provider == MAIL_PROVIDER_CLOUDMAIL:
         values["CLOUDMAIL_BASE_URL"] = str(service.get("base_url") or "").strip()
         values["CLOUDMAIL_EMAIL"] = str(service.get("email") or "").strip()
@@ -479,6 +510,10 @@ def get_mail_client(
             from autoteam.cloudflare_temp_email import CloudflareTempEmailClient
 
             return CloudflareTempEmailClient(service=resolved_service)
+        if resolved_provider == MAIL_PROVIDER_TEMPMAIL:
+            from autoteam.tempmail import TempmailClient
+
+            return TempmailClient(service=resolved_service)
 
         from autoteam.cloudmail import CloudMailClient
 
@@ -489,6 +524,10 @@ def get_mail_client(
         from autoteam.cloudflare_temp_email import CloudflareTempEmailClient
 
         return CloudflareTempEmailClient()
+    if resolved_provider == MAIL_PROVIDER_TEMPMAIL:
+        from autoteam.tempmail import TempmailClient
+
+        return TempmailClient()
 
     from autoteam.cloudmail import CloudMailClient
 

@@ -56,7 +56,7 @@ from autoteam.codex_auth import (
     refresh_access_token,
     save_auth_file,
 )
-from autoteam.config import get_playwright_launch_options
+from autoteam.config import clear_last_easyproxy_assignment, get_playwright_launch_options, mark_last_easyproxy_assignment_bad
 from autoteam.cpa_sync import sync_from_cpa
 from autoteam.mail_provider import (
     get_account_mail_provider,
@@ -1329,7 +1329,12 @@ def _complete_registration(email, password, invite_link, mail_client):
 
     logger.info("[注册] 开始注册 %s...", email)
     with sync_playwright() as p:
-        browser = p.chromium.launch(**get_playwright_launch_options())
+        try:
+            browser = p.chromium.launch(**get_playwright_launch_options())
+            clear_last_easyproxy_assignment()
+        except Exception as exc:
+            mark_last_easyproxy_assignment_bad(str(exc))
+            raise
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -1467,7 +1472,11 @@ _DIRECT_EMAIL_SELECTORS = (
     'input[placeholder*="email" i], input[placeholder*="Email" i]'
 )
 _DIRECT_PASSWORD_SELECTORS = 'input[name="password"], input[type="password"]'
-_DIRECT_CODE_SELECTORS = 'input[name="code"], input[placeholder*="验证码"], input[placeholder*="code" i]'
+_DIRECT_CODE_SELECTORS = (
+    'input[name="code"], input[inputmode="numeric"], input[autocomplete="one-time-code"], '
+    'input[placeholder*="验证码"], input[placeholder*="code" i]'
+)
+_DIRECT_OTP_SINGLE_INPUT_SELECTORS = 'input[maxlength="1"], input[data-input-otp], input[aria-label*="digit" i]'
 
 
 def _safe_invite_screenshot(page, name):
@@ -1564,6 +1573,130 @@ def _first_visible_editable_locator(page, selectors, timeout=800):
             return locator
     except Exception:
         return None
+    return None
+
+
+def _visible_direct_otp_slot_inputs(page, timeout=300):
+    try:
+        candidates = page.locator(_DIRECT_OTP_SINGLE_INPUT_SELECTORS).all()
+    except Exception:
+        return []
+
+    visible = []
+    for loc in candidates:
+        try:
+            if loc.is_visible(timeout=timeout):
+                visible.append(loc)
+        except Exception:
+            continue
+    return visible
+
+
+def _is_direct_otp_input_visible(page, timeout=500):
+    if _visible_direct_otp_slot_inputs(page, timeout=timeout):
+        return True
+    try:
+        return page.locator(_DIRECT_CODE_SELECTORS).first.is_visible(timeout=timeout)
+    except Exception:
+        return False
+
+
+def _fill_direct_otp_code(page, code: str) -> bool:
+    value = str(code or "").strip()
+    if not value:
+        return False
+
+    slot_inputs = _visible_direct_otp_slot_inputs(page, timeout=200)
+    if len(slot_inputs) >= min(4, len(value)):
+        logger.info("[直接注册] 检测到 %d 个单字符验证码输入框", len(slot_inputs))
+        for index, char in enumerate(value):
+            if index >= len(slot_inputs):
+                break
+            loc = slot_inputs[index]
+            try:
+                loc.click(force=True)
+            except Exception:
+                pass
+            try:
+                loc.fill("")
+            except Exception:
+                pass
+            try:
+                loc.fill(char)
+            except Exception:
+                try:
+                    loc.type(char, delay=50)
+                except Exception:
+                    try:
+                        page.keyboard.type(char, delay=50)
+                    except Exception:
+                        return False
+            time.sleep(0.1)
+        return True
+
+    try:
+        otp_input = page.locator(_DIRECT_CODE_SELECTORS).first
+        if otp_input.is_visible(timeout=2000):
+            otp_input.fill(value)
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _click_direct_otp_submit_button(page) -> bool:
+    for selector in (
+        'button[type="submit"]',
+        'button:has-text("Continue")',
+        'button:has-text("继续")',
+        'button:has-text("Verify")',
+    ):
+        try:
+            button = page.locator(selector).first
+            if button.is_visible(timeout=800):
+                button.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_direct_otp_input(page, timeout=25):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        step = _detect_direct_register_step(page)
+        if step != "code":
+            return step
+        if _is_direct_otp_input_visible(page, timeout=500):
+            return "ready"
+        time.sleep(0.5)
+    return "ready" if _is_direct_otp_input_visible(page, timeout=300) else _detect_direct_register_step(page)
+
+
+def _wait_for_direct_verification_code(mail_client, email, *, mail_account_id=None, timeout=MAIL_TIMEOUT):
+    if getattr(mail_client, "provider_name", "") == "tempmail" and hasattr(mail_client, "wait_for_otp"):
+        return mail_client.wait_for_otp(
+            email,
+            timeout=timeout,
+            sender_keyword="openai",
+            account_id=mail_account_id,
+        )
+
+    verification_code = None
+    start_t = time.time()
+    while time.time() - start_t < timeout:
+        emails = mail_client.search_emails_by_recipient(email, size=10, account_id=mail_account_id)
+        for em in emails:
+            subject = str(em.get("subject") or "").lower()
+            if "invited" in subject or "invitation" in subject:
+                continue
+            verification_code = mail_client.extract_verification_code(em)
+            if verification_code:
+                return verification_code
+        elapsed = int(time.time() - start_t)
+        print(f"\r  等待验证码... ({elapsed}s)", end="", flush=True)
+        time.sleep(3)
     return None
 
 
@@ -1874,7 +2007,12 @@ def _register_direct_once(
         launch_kwargs = get_playwright_launch_options()
         if sys.platform.startswith("win"):
             launch_kwargs["slow_mo"] = 100
-        browser = p.chromium.launch(**launch_kwargs)
+        try:
+            browser = p.chromium.launch(**launch_kwargs)
+            clear_last_easyproxy_assignment()
+        except Exception as exc:
+            mark_last_easyproxy_assignment_bad(str(exc))
+            raise
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -2095,40 +2233,43 @@ def _register_direct_once(
             browser.close()
             return False
 
-        code_input = None
-        try:
-            code_input = page.locator(_DIRECT_CODE_SELECTORS).first
-            if not code_input.is_visible(timeout=5000):
-                code_input = None
-        except Exception:
-            code_input = None
-
-        if code_input:
-            logger.info("[直接注册] 等待验证码...")
-            verification_code = None
-            start_t = time.time()
-            while time.time() - start_t < MAIL_TIMEOUT:
-                emails = mail_client.search_emails_by_recipient(email, size=10, account_id=mail_account_id)
-                for em in emails:
-                    verification_code = mail_client.extract_verification_code(em)
-                    if verification_code:
-                        break
-                if verification_code:
-                    break
-                elapsed = int(time.time() - start_t)
-                print(f"\r  等待验证码... ({elapsed}s)", end="", flush=True)
-                time.sleep(3)
-
-            if verification_code:
-                logger.info("[直接注册] 输入验证码: %s", verification_code)
-                code_input.fill(verification_code)
-                time.sleep(0.5)
-                _click_primary_auth_button(page, code_input, ["Continue", "继续"])
-                time.sleep(8)
-            else:
+        if current_step == "code":
+            logger.info("[直接注册] 已进入邮箱验证码页，开始轮询 %s 的验证码邮件", email)
+            verification_code = _wait_for_direct_verification_code(
+                mail_client,
+                email,
+                mail_account_id=mail_account_id,
+                timeout=MAIL_TIMEOUT,
+            )
+            print()
+            if not verification_code:
                 logger.error("[直接注册] 未收到验证码")
+                _safe_invite_screenshot(page, "direct_05_no_code.png")
                 browser.close()
                 return False
+
+            otp_ready = _wait_for_direct_otp_input(page, timeout=25)
+            logger.info("[直接注册] 验证码输入框状态: %s | URL: %s", otp_ready, page.url)
+            if otp_ready != "ready":
+                logger.warning("[直接注册] 验证码页在输入前已切换状态: %s | URL: %s", otp_ready, page.url)
+
+            logger.info("[直接注册] 输入验证码: %s", verification_code)
+            if not _fill_direct_otp_code(page, verification_code):
+                logger.error("[直接注册] 未找到可用的验证码输入框 | URL: %s | body=%s", page.url, _page_excerpt(page))
+                _safe_invite_screenshot(page, "direct_05_no_code_input.png")
+                browser.close()
+                return False
+
+            time.sleep(0.5)
+            if not _click_direct_otp_submit_button(page):
+                logger.warning("[直接注册] 未找到明显的验证码提交按钮，尝试回车提交")
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:
+                    pass
+            next_step = _wait_for_direct_step_change(page, "code", timeout=15)
+            logger.info("[直接注册] 提交验证码后状态: %s | URL: %s", next_step, page.url)
+            time.sleep(2)
 
         _safe_invite_screenshot(page, "direct_05_after_code.png")
         logger.info("[直接注册] 当前 URL: %s", page.url)
@@ -2318,7 +2459,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
     return True
 
 
-def cmd_rotate(target_seats=5, force_auth_repair=False):
+def cmd_rotate(target_seats=2, force_auth_repair=False):
     """
     智能轮转 - 保持 Team 始终有 target_seats 个可用成员，尽量少创建新账号。
 
@@ -3087,7 +3228,7 @@ def get_team_member_count(chatgpt_api):
     return len(members)
 
 
-def cmd_fill(target=5):
+def cmd_fill(target=2):
     """检测 Team 成员数，不足 target 则自动添加新账号补满"""
     _abort_if_cancel_requested()
     chatgpt = ChatGPTTeamAPI()
@@ -3236,7 +3377,7 @@ def cmd_cleanup(max_seats=None):
 
         # 确定要移除的数量
         if max_seats is None:
-            max_seats = 5
+            max_seats = 2
             logger.info("[清理] 未指定上限，使用默认总人数: %d", max_seats)
         to_remove_count = total - max_seats
         if to_remove_count <= 0:
@@ -3401,7 +3542,7 @@ def main():
     sub.add_parser("status", help="查看所有账号状态")
     sub.add_parser("check", help="检查活跃账号 Codex 额度")
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
-    rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
+    rotate_p.add_argument("target", type=int, nargs="?", default=2, help="目标成员数（默认 2）")
     sub.add_parser("add", help="手动添加一个新账号")
     sub.add_parser("manual-add", help="手动 OAuth 添加账号（打开链接登录后粘贴回调 URL）")
     admin_login_p = sub.add_parser("admin-login", help="交互式完成管理员主号登录")
@@ -3411,7 +3552,7 @@ def main():
     sub.add_parser("main-codex-sync", help="交互式同步主号 Codex 到已启用远端")
 
     fill_p = sub.add_parser("fill", help="补满 Team 成员到指定数量")
-    fill_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
+    fill_p.add_argument("target", type=int, nargs="?", default=2, help="目标成员数（默认 2）")
 
     cleanup_p = sub.add_parser("cleanup", help="清理多余成员（只移除本地管理的）")
     cleanup_p.add_argument("max_seats", type=int, nargs="?", default=None, help="最大席位数")

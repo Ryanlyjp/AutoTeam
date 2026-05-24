@@ -20,7 +20,7 @@ from autoteam.admin_state import (
     get_chatgpt_workspace_name,
 )
 from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
-from autoteam.config import get_playwright_launch_options
+from autoteam.config import clear_last_easyproxy_assignment, get_playwright_launch_options, mark_last_easyproxy_assignment_bad
 from autoteam.signup_profile import SignupProfile, generate_signup_profile
 from autoteam.textio import write_text
 
@@ -473,17 +473,24 @@ def _poll_mail_verification_code(
     mail_client,
     email: str,
     *,
-    after_email_id: int,
-    used_email_ids: set[int],
+    after_email_id,
+    used_email_ids: set[str],
     timeout: int = 120,
     require_sender: bool = False,
 ):
     deadline = time.time() + timeout
     while time.time() < deadline:
         for em in mail_client.search_emails_by_recipient(email, size=5):
-            email_id = em.get("emailId", 0)
-            if email_id <= after_email_id or email_id in used_email_ids:
+            raw_email_id = em.get("emailId")
+            email_id = str(raw_email_id).strip() if raw_email_id not in (None, "") else ""
+            if email_id and email_id in used_email_ids:
                 continue
+            if after_email_id not in (None, "", 0):
+                try:
+                    if int(raw_email_id) <= int(after_email_id):
+                        continue
+                except (TypeError, ValueError):
+                    pass
 
             if require_sender:
                 sender = (em.get("sendEmail") or "").lower()
@@ -496,10 +503,10 @@ def _poll_mail_verification_code(
 
             code = mail_client.extract_verification_code(em)
             if code:
-                return code, email_id
+                return code, email_id or str(em.get("createTime") or "")
         time.sleep(3)
 
-    return None, 0
+    return None, ""
 
 
 def _resolve_email_verification(
@@ -507,14 +514,14 @@ def _resolve_email_verification(
     *,
     mail_client,
     email: str,
-    after_email_id: int,
-    used_email_ids: set[int],
+    after_email_id,
+    used_email_ids: set[str],
     wait_log: str,
     require_sender: bool = False,
     wait_timeout: int = 120,
     submit_timeout: int = 15,
 ) -> str:
-    logger.info(wait_log, after_email_id)
+    logger.info(wait_log, len(used_email_ids))
 
     otp, otp_email_id = _poll_mail_verification_code(
         mail_client,
@@ -875,7 +882,7 @@ def login_codex_via_browser(
     """
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(16)
-    _used_email_ids: set[int] = set()  # 记录已尝试过的邮件，避免重复提交同一封验证码邮件
+    _used_email_ids: set[str] = set()  # 记录已存在/已尝试过的邮件，避免重复提交同一封验证码邮件
 
     chatgpt_account_id = get_chatgpt_account_id()
 
@@ -887,7 +894,12 @@ def login_codex_via_browser(
     failure_result = None
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(**get_playwright_launch_options())
+        try:
+            browser = p.chromium.launch(**get_playwright_launch_options())
+            clear_last_easyproxy_assignment()
+        except Exception as exc:
+            mark_last_easyproxy_assignment_bad(str(exc))
+            raise
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -922,7 +934,11 @@ def login_codex_via_browser(
         _email_id_before_login = 0
         if mail_client:
             try:
-                _pre = mail_client.search_emails_by_recipient(email, size=1)
+                _pre = mail_client.search_emails_by_recipient(email, size=10)
+                for message in _pre:
+                    message_id = str(message.get("emailId") or "").strip()
+                    if message_id:
+                        _used_email_ids.add(message_id)
                 if _pre:
                     _email_id_before_login = _pre[0].get("emailId", 0)
             except Exception:
@@ -989,7 +1005,7 @@ def login_codex_via_browser(
                     email=email,
                     after_email_id=_email_id_before_login,
                     used_email_ids=_used_email_ids,
-                    wait_log="[Codex] ChatGPT 登录需要验证码，等待 emailId > %d 的新邮件...",
+                    wait_log="[Codex] ChatGPT 登录需要验证码，等待新邮件（已跳过 %s 封已有邮件）...",
                 )
         except Exception:
             pass
@@ -1100,7 +1116,7 @@ def login_codex_via_browser(
                 email=email,
                 after_email_id=_email_id_before_login,
                 used_email_ids=_used_email_ids,
-                wait_log="[Codex] 需要登录验证码，等待 emailId > %d 的新邮件...",
+                wait_log="[Codex] 需要登录验证码，等待新邮件（已跳过 %s 封已有邮件）...",
             )
             _screenshot(page, "codex_03c_after_otp.png")
         elif code_input_visible:
@@ -1234,7 +1250,7 @@ def login_codex_via_browser(
                         email=email,
                         after_email_id=_email_id_before_login,
                         used_email_ids=_used_email_ids,
-                        wait_log=f"[Codex] 需要邮箱验证码 (step {step + 1})，等待 emailId > %d 的新邮件...",
+                        wait_log=f"[Codex] 需要邮箱验证码 (step {step + 1})，等待新邮件（已跳过 %s 封已有邮件）...",
                         require_sender=True,
                     )
                     if submit_status == "accepted":

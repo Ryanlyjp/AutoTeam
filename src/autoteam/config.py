@@ -1,10 +1,13 @@
 """配置文件 - 从 .env 文件或环境变量加载"""
 
+import logging
 import os
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from autoteam.textio import parse_env_line, parse_env_value, read_text
+
+logger = logging.getLogger(__name__)
 
 # 项目根目录（pyproject.toml 所在位置）
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -53,6 +56,13 @@ def _normalize_chatgpt_api_transport(value: str) -> str:
     return "auto"
 
 
+def _normalize_easyproxy_master_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"direct", "follow_pool"}:
+        return mode
+    return "direct"
+
+
 # CloudMail 配置
 CLOUDMAIL_BASE_URL = os.environ.get("CLOUDMAIL_BASE_URL", "")
 CLOUDMAIL_EMAIL = os.environ.get("CLOUDMAIL_EMAIL", "")
@@ -68,6 +78,11 @@ MAIL_SERVICE_DEFAULT = os.environ.get("MAIL_SERVICE_DEFAULT", "").strip()
 CF_TEMP_EMAIL_BASE_URL = os.environ.get("CF_TEMP_EMAIL_BASE_URL", "")
 CF_TEMP_EMAIL_ADMIN_PASSWORD = os.environ.get("CF_TEMP_EMAIL_ADMIN_PASSWORD", "")
 CF_TEMP_EMAIL_DOMAIN = os.environ.get("CF_TEMP_EMAIL_DOMAIN", "")
+
+# Tempmail 配置
+TEMPMAIL_BASE_URL = os.environ.get("TEMPMAIL_BASE_URL", "")
+TEMPMAIL_API_KEY = os.environ.get("TEMPMAIL_API_KEY", "")
+TEMPMAIL_DOMAIN = os.environ.get("TEMPMAIL_DOMAIN", "")
 
 # ChatGPT Team 配置
 CHATGPT_ACCOUNT_ID = os.environ.get("CHATGPT_ACCOUNT_ID", "")
@@ -100,9 +115,9 @@ API_KEY = os.environ.get("API_KEY", "")
 
 # 自动巡检配置
 AUTO_CHECK_INTERVAL = _get_int_env("AUTO_CHECK_INTERVAL", 300)  # 巡检间隔（秒），默认 5 分钟
-AUTO_CHECK_TARGET_SEATS = _get_int_env("AUTO_CHECK_TARGET_SEATS", 5)  # 自动巡检目标 Team seat 数
+AUTO_CHECK_TARGET_SEATS = _get_int_env("AUTO_CHECK_TARGET_SEATS", 2)  # 自动巡检目标 Team seat 数
 AUTO_CHECK_THRESHOLD = _get_int_env("AUTO_CHECK_THRESHOLD", 10)  # 额度低于此百分比触发轮转，默认 10%
-AUTO_CHECK_MIN_LOW = _get_int_env("AUTO_CHECK_MIN_LOW", 2)  # 至少几个账号低于阈值才触发，默认 2
+AUTO_CHECK_MIN_LOW = _get_int_env("AUTO_CHECK_MIN_LOW", 1)  # 至少几个账号低于阈值才触发，默认 1
 AUTO_CHECK_RETRY_ADD_PHONE = _get_bool_env("AUTO_CHECK_RETRY_ADD_PHONE", True)  # 是否自动重试 add_phone
 AUTO_CHECK_ADD_PHONE_MAX_RETRIES = _get_int_env("AUTO_CHECK_ADD_PHONE_MAX_RETRIES", 3)  # add_phone 最大自动重试次数
 
@@ -112,6 +127,17 @@ PLAYWRIGHT_PROXY_SERVER = os.environ.get("PLAYWRIGHT_PROXY_SERVER", "").strip()
 PLAYWRIGHT_PROXY_USERNAME = os.environ.get("PLAYWRIGHT_PROXY_USERNAME", "").strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.environ.get("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
 PLAYWRIGHT_PROXY_BYPASS = os.environ.get("PLAYWRIGHT_PROXY_BYPASS", "").strip()
+
+# EasyProxy 配置
+EASYPROXY_ENABLED = _get_bool_env("EASYPROXY_ENABLED", False)
+EASYPROXY_MANAGEMENT_URL = _get_str_env("EASYPROXY_MANAGEMENT_URL", "http://127.0.0.1:9888")
+EASYPROXY_PASSWORD = _get_str_env("EASYPROXY_PASSWORD", "")
+EASYPROXY_PROXY_HOST = _get_str_env("EASYPROXY_PROXY_HOST", "127.0.0.1") or "127.0.0.1"
+EASYPROXY_POOL_PORT = _get_int_env("EASYPROXY_POOL_PORT", 2323)
+EASYPROXY_PORT_MIN = _get_int_env("EASYPROXY_PORT_MIN", 24000)
+EASYPROXY_PORT_MAX = _get_int_env("EASYPROXY_PORT_MAX", 24100)
+EASYPROXY_COOLDOWN_MINUTES = _get_int_env("EASYPROXY_COOLDOWN_MINUTES", 60)
+EASYPROXY_MASTER_MODE = _normalize_easyproxy_master_mode(_get_str_env("EASYPROXY_MASTER_MODE", "direct"))
 
 
 def _format_proxy_host(hostname: str) -> str:
@@ -141,22 +167,13 @@ def _parse_proxy_url(proxy_url: str):
     return proxy
 
 
-def get_chatgpt_api_transport() -> str:
-    return _normalize_chatgpt_api_transport(_get_str_env("CHATGPT_API_TRANSPORT", "auto"))
+def get_easyproxy_pool_proxy_url() -> str:
+    return f"http://{EASYPROXY_PROXY_HOST}:{EASYPROXY_POOL_PORT}"
 
 
-def get_chatgpt_api_http_timeout() -> int:
-    return max(5, _get_int_env("CHATGPT_API_HTTP_TIMEOUT", 60))
-
-
-def get_chatgpt_api_impersonate() -> str:
-    return _get_str_env("CHATGPT_API_IMPERSONATE", "chrome136") or "chrome136"
-
-
-def get_chatgpt_http_proxy_url() -> str:
-    proxy_url = _get_str_env("PLAYWRIGHT_PROXY_URL", "")
-    if proxy_url:
-        return proxy_url
+def _get_manual_proxy_url() -> str:
+    if PLAYWRIGHT_PROXY_URL:
+        return PLAYWRIGHT_PROXY_URL
 
     proxy_server = _get_str_env("PLAYWRIGHT_PROXY_SERVER", "")
     if not proxy_server:
@@ -182,6 +199,72 @@ def get_chatgpt_http_proxy_url() -> str:
     return proxy
 
 
+def get_effective_proxy_url() -> str:
+    if EASYPROXY_ENABLED:
+        if EASYPROXY_MASTER_MODE == "follow_pool":
+            return get_easyproxy_pool_proxy_url()
+        return ""
+    return _get_manual_proxy_url()
+
+
+def get_chatgpt_api_transport() -> str:
+    return _normalize_chatgpt_api_transport(_get_str_env("CHATGPT_API_TRANSPORT", "auto"))
+
+
+def get_chatgpt_api_http_timeout() -> int:
+    return max(5, _get_int_env("CHATGPT_API_HTTP_TIMEOUT", 60))
+
+
+def get_chatgpt_api_impersonate() -> str:
+    return _get_str_env("CHATGPT_API_IMPERSONATE", "chrome136") or "chrome136"
+
+
+def get_chatgpt_http_proxy_url() -> str:
+    return get_effective_proxy_url()
+
+
+def _build_easyproxy_browser_proxy():
+    from autoteam import easyproxy
+
+    if not EASYPROXY_ENABLED:
+        return None
+
+    assignment = easyproxy.select_proxy_assignment(env=os.environ)
+    proxy = {"server": assignment["proxy_url"]}
+    if PLAYWRIGHT_PROXY_BYPASS:
+        proxy["bypass"] = PLAYWRIGHT_PROXY_BYPASS
+    logger.info(
+        "[EasyProxy] 浏览器随机选择端口 %s (%s)",
+        assignment["port"],
+        assignment.get("tag") or assignment.get("name") or "-",
+    )
+    return proxy
+
+
+def mark_last_easyproxy_assignment_bad(reason: str) -> None:
+    if not EASYPROXY_ENABLED:
+        return
+    try:
+        from autoteam import easyproxy
+
+        result = easyproxy.mark_pending_assignment_bad(reason, env=os.environ)
+        if result is not None:
+            logger.warning("[EasyProxy] 当前端口已加入本地黑名单: %s", reason)
+    except Exception as exc:
+        logger.warning("[EasyProxy] 写入本地黑名单失败: %s", exc)
+
+
+def clear_last_easyproxy_assignment() -> None:
+    if not EASYPROXY_ENABLED:
+        return
+    try:
+        from autoteam import easyproxy
+
+        easyproxy.clear_pending_assignment()
+    except Exception:
+        pass
+
+
 def get_playwright_launch_options():
     """统一的 Playwright Chromium 启动参数。"""
     options = {
@@ -190,17 +273,15 @@ def get_playwright_launch_options():
     }
 
     proxy = None
-    if PLAYWRIGHT_PROXY_URL:
-        proxy = _parse_proxy_url(PLAYWRIGHT_PROXY_URL)
-    elif PLAYWRIGHT_PROXY_SERVER:
-        proxy = {"server": PLAYWRIGHT_PROXY_SERVER}
-        if PLAYWRIGHT_PROXY_USERNAME:
-            proxy["username"] = PLAYWRIGHT_PROXY_USERNAME
-        if PLAYWRIGHT_PROXY_PASSWORD:
-            proxy["password"] = PLAYWRIGHT_PROXY_PASSWORD
+    if EASYPROXY_ENABLED:
+        proxy = _build_easyproxy_browser_proxy()
+    else:
+        proxy_url = _get_manual_proxy_url()
+        if proxy_url:
+            proxy = _parse_proxy_url(proxy_url)
 
     if proxy:
-        if PLAYWRIGHT_PROXY_BYPASS:
+        if PLAYWRIGHT_PROXY_BYPASS and "bypass" not in proxy:
             proxy["bypass"] = PLAYWRIGHT_PROXY_BYPASS
         options["proxy"] = proxy
 

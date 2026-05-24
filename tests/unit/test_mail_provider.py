@@ -100,6 +100,33 @@ def test_get_account_mail_service_id_falls_back_to_single_configured_service():
     assert getattr(client, "provider_name", "") == "cloudmail"
 
 
+def test_tempmail_service_is_supported_in_structured_mail_services():
+    env = {
+        "MAIL_SERVICES_JSON": json.dumps(
+            [
+                {
+                    "id": "tm-1",
+                    "type": "tempmail",
+                    "base_url": "https://tempmail-api.example.com",
+                    "api_key": "secret-key",
+                }
+            ]
+        ),
+        "MAIL_SERVICE_DEFAULT": "tm-1",
+    }
+
+    services = mail_provider.get_mail_services(env)
+
+    assert services[0]["type"] == "tempmail"
+    assert mail_provider.get_mail_provider_name(env) == "tempmail"
+    assert mail_provider.get_mail_domain(env=env) == ""
+    assert mail_provider.get_mail_service_missing_fields(services[0]) == []
+
+    client = mail_provider.get_mail_client(env=env)
+    assert getattr(client, "provider_name", "") == "tempmail"
+    assert getattr(client, "service_id", None) == "tm-1"
+
+
 def test_get_mail_client_for_account_rejects_ambiguous_service_selection():
     env = {
         "MAIL_SERVICES_JSON": json.dumps(

@@ -9,6 +9,7 @@ import sys
 from autoteam.config import PROJECT_ROOT
 from autoteam.mail_provider import (
     MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL,
+    MAIL_PROVIDER_TEMPMAIL,
     get_default_mail_service,
     get_mail_provider_name,
     get_mail_service_display_name,
@@ -29,7 +30,7 @@ STARTUP_REQUIRED_CONFIGS = [
 
 # 可在配置面板中编辑的配置项（key, 提示, 默认值, 是否可选）
 REQUIRED_CONFIGS = [
-    ("MAIL_PROVIDER", "邮箱服务提供者（cloudmail/cloudflare_temp_email）", "cloudmail", True),
+    ("MAIL_PROVIDER", "邮箱服务提供者（cloudmail/cloudflare_temp_email/tempmail）", "cloudmail", True),
     ("MAIL_SERVICES_JSON", "邮箱服务列表 JSON（内部使用）", "", True),
     ("MAIL_SERVICE_DEFAULT", "默认新建邮箱服务 ID（内部使用）", "", True),
     ("CLOUDMAIL_BASE_URL", "CloudMail API 地址", "", True),
@@ -39,6 +40,9 @@ REQUIRED_CONFIGS = [
     ("CF_TEMP_EMAIL_BASE_URL", "Cloudflare Temp Email 地址", "", True),
     ("CF_TEMP_EMAIL_ADMIN_PASSWORD", "Cloudflare Temp Email 管理密码", "", True),
     ("CF_TEMP_EMAIL_DOMAIN", "Cloudflare Temp Email 邮箱域名（如 example.com）", "", True),
+    ("TEMPMAIL_BASE_URL", "Tempmail API 地址", "", True),
+    ("TEMPMAIL_API_KEY", "Tempmail API Key", "", True),
+    ("TEMPMAIL_DOMAIN", "Tempmail 邮箱域名（可选；留空则由后端随机分配）", "", True),
     ("SYNC_TARGET_CPA", "启用 CPA 同步（true/false）", "", True),
     ("CPA_URL", "CPA (CLIProxyAPI) 地址", "http://127.0.0.1:8317", True),
     ("CPA_KEY", "CPA 管理密钥", "", True),
@@ -56,6 +60,15 @@ REQUIRED_CONFIGS = [
     ("SUB2API_OPENAI_WS_MODE", "Sub2API OpenAI WS 模式（off/ctx_pool/passthrough）", "off", True),
     ("SUB2API_OPENAI_PASSTHROUGH", "Sub2API OpenAI passthrough（true/false）", "false", True),
     ("SUB2API_OVERWRITE_ACCOUNT_SETTINGS", "Sub2API 同步时覆盖账号默认设置（true/false）", "false", True),
+    ("EASYPROXY_ENABLED", "启用 EasyProxy 接管（true/false）", "false", True),
+    ("EASYPROXY_MANAGEMENT_URL", "EasyProxy 管理 API 地址", "http://127.0.0.1:9888", True),
+    ("EASYPROXY_PASSWORD", "EasyProxy 管理密码", "", True),
+    ("EASYPROXY_PROXY_HOST", "EasyProxy 代理出口主机", "127.0.0.1", True),
+    ("EASYPROXY_POOL_PORT", "EasyProxy 池化端口", "2323", True),
+    ("EASYPROXY_PORT_MIN", "EasyProxy hybrid 最小端口", "24000", True),
+    ("EASYPROXY_PORT_MAX", "EasyProxy hybrid 最大端口", "24100", True),
+    ("EASYPROXY_COOLDOWN_MINUTES", "EasyProxy 本地黑名单冷却分钟数", "60", True),
+    ("EASYPROXY_MASTER_MODE", "EasyProxy 主流程模式（direct/follow_pool）", "direct", True),
     ("PLAYWRIGHT_PROXY_URL", "Playwright 浏览器代理 URL（可选，如 socks5://host:port）", "", True),
     ("PLAYWRIGHT_PROXY_BYPASS", "Playwright 代理绕过列表（可选，如 localhost,127.0.0.1）", "", True),
     ("API_KEY", "API 鉴权密钥（回车自动生成）", "", False),
@@ -178,6 +191,12 @@ def check_and_setup(interactive: bool = True) -> bool:
     except Exception:
         pass
     try:
+        import autoteam.tempmail
+
+        importlib.reload(autoteam.tempmail)
+    except Exception:
+        pass
+    try:
         import autoteam.mail_provider
 
         importlib.reload(autoteam.mail_provider)
@@ -280,6 +299,55 @@ def _verify_cloudflare_temp_email(service: dict | None = None):
     return True
 
 
+def _verify_tempmail(service: dict | None = None):
+    """验证 Tempmail 配置是否正确：鉴权 + 创建测试邮箱 + 删除。"""
+    service = service or {}
+    base_url = str(service.get("base_url") or os.environ.get("TEMPMAIL_BASE_URL", "") or "").strip()
+    api_key = str(service.get("api_key") or os.environ.get("TEMPMAIL_API_KEY", "") or "").strip()
+    domain = str(service.get("domain") or os.environ.get("TEMPMAIL_DOMAIN", "") or "").strip()
+
+    if not all([base_url, api_key]):
+        return
+
+    label = get_mail_service_display_name(service or {"type": MAIL_PROVIDER_TEMPMAIL, "domain": domain})
+    logger.info("[验证] %s 配置...", label)
+
+    try:
+        from autoteam.tempmail import TempmailClient
+
+        client = TempmailClient(service=service or None)
+        client.login()
+        logger.info("[验证] %s 登录成功", label)
+    except Exception as e:
+        logger.error("[验证] %s 登录失败: %s", label, e)
+        logger.error("[验证] 请检查 %s 的 base_url / api_key", label)
+        return False
+
+    test_account_id = None
+    try:
+        import uuid as _uuid
+
+        test_account_id, test_email = client.create_temp_email(prefix=f"at-test-{_uuid.uuid4().hex[:6]}")
+        logger.info("[验证] %s 创建测试邮箱成功: %s", label, test_email)
+    except Exception as e:
+        logger.error("[验证] %s 创建邮箱失败: %s", label, e)
+        if domain:
+            logger.error("[验证] 请检查 %s 的 domain 是否正确", label)
+        else:
+            logger.error("[验证] 请检查 %s 后端是否支持随机分配邮箱域名", label)
+        return False
+
+    try:
+        if test_account_id:
+            client.delete_account(test_account_id)
+            logger.info("[验证] %s 测试邮箱已清理", label)
+    except Exception as e:
+        logger.warning("[验证] %s 清理测试邮箱失败: %s（不影响使用）", label, e)
+
+    logger.info("[验证] %s 配置验证通过", label)
+    return True
+
+
 def _verify_mail_provider(provider: str | None = None):
     default_service = get_default_mail_service()
     if default_service:
@@ -288,6 +356,8 @@ def _verify_mail_provider(provider: str | None = None):
     resolved = provider or get_mail_provider_name()
     if resolved == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         return _verify_cloudflare_temp_email()
+    if resolved == MAIL_PROVIDER_TEMPMAIL:
+        return _verify_tempmail()
     return _verify_cloudmail()
 
 
@@ -296,6 +366,8 @@ def _verify_mail_service(service: dict | None):
     provider = service.get("type")
     if provider == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         return _verify_cloudflare_temp_email(service)
+    if provider == MAIL_PROVIDER_TEMPMAIL:
+        return _verify_tempmail(service)
     return _verify_cloudmail(service)
 
 

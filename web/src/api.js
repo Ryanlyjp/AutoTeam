@@ -46,6 +46,8 @@ export const api = {
   saveRuntimeConfig: (config) => request('PUT', '/config/runtime', config),
   getRuntimeConfigSource: () => request('GET', '/config/source'),
   saveRuntimeConfigSource: (payload) => request('PUT', '/config/source', payload),
+  easyproxyStatus: () => request('GET', '/easyproxy/status'),
+  easyproxyRelease: (payload) => request('POST', '/easyproxy/release', payload || {}),
 
   getStatus: () => request('GET', '/status'),
   getAdminStatus: () => request('GET', '/admin/status'),
