@@ -870,7 +870,464 @@ def _select_oauth_account(page, email: str) -> bool:
     return False
 
 
+def _extract_auth_code(url) -> str | None:
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        query = urllib.parse.parse_qs(parsed.query)
+    except Exception:
+        return None
+    code = query.get("code", [None])[0]
+    return str(code or "").strip() or None
+
+
+def _extract_callback_url(text: str) -> str:
+    match = re.search(rf"(https?://localhost:{CODEX_CALLBACK_PORT}/auth/callback[^\s'\"<>]+)", str(text or ""))
+    return match.group(1) if match else ""
+
+
+def _extract_auth_code_from_exception(exc) -> str | None:
+    return _extract_auth_code(_extract_callback_url(str(exc or "")))
+
+
+def _capture_auth_code_from_page(page) -> str | None:
+    code = _extract_auth_code(getattr(page, "url", ""))
+    if code:
+        return code
+
+    try:
+        frames = getattr(page, "frames", [])
+        if callable(frames):
+            frames = frames()
+    except Exception:
+        frames = []
+
+    for frame in frames or []:
+        code = _extract_auth_code(getattr(frame, "url", ""))
+        if code:
+            return code
+    return None
+
+
+def _build_context_cookie_header(context, url: str) -> str:
+    try:
+        cookies = context.cookies([url])
+    except Exception:
+        return ""
+
+    parts = []
+    for cookie in cookies or []:
+        name = str(cookie.get("name") or "").strip()
+        if not name:
+            continue
+        parts.append(f"{name}={cookie.get('value', '')}")
+    return "; ".join(parts)
+
+
+def _follow_oauth_redirect_chain(context, start_url: str, *, referer: str | None = None, max_hops: int = 8) -> str | None:
+    import requests
+
+    current = str(start_url or "").strip()
+    if not current:
+        return None
+
+    previous = str(referer or "").strip()
+    session = requests.Session()
+
+    for _hop in range(max_hops):
+        code = _extract_auth_code(current)
+        if code:
+            return code
+
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        if previous:
+            headers["Referer"] = previous
+
+        cookie_header = _build_context_cookie_header(context, current)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+
+        try:
+            response = session.get(current, headers=headers, allow_redirects=False, timeout=20)
+        except Exception as exc:
+            return _extract_auth_code_from_exception(exc)
+
+        location = str(response.headers.get("location") or "").strip()
+        if response.status_code in (301, 302, 303, 307, 308) and location:
+            previous = current
+            current = urllib.parse.urljoin(current, location)
+            continue
+
+        return _extract_auth_code(getattr(response, "url", "") or current)
+
+    return None
+
+
+def _login_codex_via_browser_direct(
+    email, password, mail_client=None, *, return_result=False, signup_profile: SignupProfile | None = None
+):
+    signup_profile = signup_profile or generate_signup_profile()
+    code_verifier, code_challenge = _generate_pkce()
+    state = secrets.token_urlsafe(16)
+    used_email_ids: set[str] = set()
+    chatgpt_account_id = get_chatgpt_account_id()
+    auth_url = _build_auth_url(code_challenge, state)
+
+    logger.info("[Codex] Start OAuth: %s", email)
+
+    auth_code = None
+    failure_result = None
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch(**get_playwright_launch_options())
+            clear_last_easyproxy_assignment()
+        except Exception as exc:
+            mark_last_easyproxy_assignment_bad(str(exc))
+            raise
+
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        )
+
+        if chatgpt_account_id:
+            context.add_cookies(
+                [
+                    {
+                        "name": "_account",
+                        "value": chatgpt_account_id,
+                        "domain": "chatgpt.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                    {
+                        "name": "_account",
+                        "value": chatgpt_account_id,
+                        "domain": "auth.openai.com",
+                        "path": "/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            )
+
+        email_id_before_login = 0
+        if mail_client:
+            try:
+                existing = mail_client.search_emails_by_recipient(email, size=10)
+                for message in existing:
+                    message_id = str(message.get("emailId") or "").strip()
+                    if message_id:
+                        used_email_ids.add(message_id)
+                if existing:
+                    email_id_before_login = existing[0].get("emailId", 0)
+            except Exception:
+                pass
+
+        def remember_auth_code(url):
+            nonlocal auth_code
+            if auth_code:
+                return
+            code = _extract_auth_code(url)
+            if code:
+                auth_code = code
+                logger.info("[Codex] Captured auth code")
+
+        def on_request(request):
+            remember_auth_code(getattr(request, "url", ""))
+
+        def on_response(response):
+            remember_auth_code(getattr(response, "url", ""))
+
+        def on_frame_navigated(frame):
+            remember_auth_code(getattr(frame, "url", ""))
+
+        page = context.new_page()
+        page.on("request", on_request)
+        page.on("response", on_response)
+        try:
+            page.on("framenavigated", on_frame_navigated)
+        except Exception:
+            pass
+
+        page.goto(auth_url, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(3)
+        _screenshot(page, "codex_01_auth_page.png")
+
+        for _i in range(12):
+            if "verify you are human" not in page.content()[:2000].lower():
+                break
+            time.sleep(5)
+
+        try:
+            for attempt in range(2):
+                email_input = page.locator('input[name="email"], input[id="email-input"], input[id="email"]').first
+                if not email_input.is_visible(timeout=5000):
+                    break
+
+                email_input.fill(email)
+                time.sleep(0.5)
+                _click_primary_auth_button(page, email_input, ["Continue", "缁х画"])
+                time.sleep(3)
+
+                if not _is_google_redirect(page):
+                    break
+
+                _screenshot(page, f"codex_02_google_redirect_attempt{attempt + 1}.png")
+                logger.warning("[Codex] Email step redirected to Google; retrying (attempt %d)", attempt + 1)
+                page.go_back(wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
+            _screenshot(page, "codex_02_after_email.png")
+        except Exception:
+            _screenshot(page, "codex_02_no_email.png")
+
+        try:
+            for attempt in range(2):
+                pwd_input = page.locator('input[name="password"], input[type="password"]').first
+                if not pwd_input.is_visible(timeout=5000):
+                    break
+
+                pwd_input.fill(password)
+                time.sleep(0.5)
+                _click_primary_auth_button(page, pwd_input, ["Continue", "缁х画", "Log in"])
+                time.sleep(5)
+
+                if not _is_google_redirect(page):
+                    break
+
+                _screenshot(page, f"codex_03_google_redirect_attempt{attempt + 1}.png")
+                logger.warning("[Codex] Password step redirected to Google; retrying (attempt %d)", attempt + 1)
+                page.go_back(wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
+            _screenshot(page, "codex_03_after_password.png")
+        except Exception:
+            _screenshot(page, "codex_03_no_password.png")
+
+        code_input_visible = _is_otp_input_visible(page, timeout=5000)
+        if code_input_visible and mail_client:
+            _resolve_email_verification(
+                page,
+                mail_client=mail_client,
+                email=email,
+                after_email_id=email_id_before_login,
+                used_email_ids=used_email_ids,
+                wait_log="[Codex] Waiting for login code (%s skipped messages)...",
+            )
+            _screenshot(page, "codex_03c_after_otp.png")
+        elif code_input_visible:
+            logger.warning("[Codex] OTP required but no mail client is available")
+
+        if "about-you" in page.url:
+            _complete_oauth_about_you(page, signup_profile)
+
+        for step in range(10):
+            if auth_code:
+                break
+
+            auth_code = auth_code or _capture_auth_code_from_page(page)
+            if auth_code:
+                break
+
+            blocking_failure = _detect_early_oauth_block(page)
+            if blocking_failure:
+                _screenshot(page, f"codex_04_blocked_{step + 1}.png")
+                failure_result = blocking_failure
+                break
+
+            _screenshot(page, f"codex_04_step{step + 1}_before.png")
+
+            try:
+                if _is_choose_account_page(page):
+                    _screenshot(page, f"codex_04_choose_account_{step + 1}_before.png")
+                    selected = _select_oauth_account(page, email)
+                    _screenshot(page, f"codex_04_choose_account_{step + 1}_after.png")
+                    if selected:
+                        _wait_for_choose_account_exit(page, timeout=12)
+                    continue
+            except Exception:
+                pass
+
+            try:
+                workspace_name = get_chatgpt_workspace_name()
+                if _is_workspace_selection_page(page):
+                    selected = _select_team_workspace(page, workspace_name)
+                    _screenshot(page, f"codex_04_workspace_{step + 1}_after.png")
+                    if selected:
+                        try:
+                            cont_btn = page.locator('button:has-text("缁х画"), button:has-text("Continue")').first
+                            if cont_btn.is_visible(timeout=3000):
+                                previous_url = page.url
+                                cont_btn.click()
+                                failure = _wait_for_oauth_page_progress(page, previous_url=previous_url, timeout=3)
+                                if failure:
+                                    failure_result = failure
+                                    break
+                        except Exception:
+                            pass
+                        continue
+            except Exception:
+                pass
+
+            try:
+                pwd_field = page.locator('input[name="password"], input[type="password"]').first
+                if pwd_field.is_visible(timeout=2000):
+                    pwd_field.fill(password)
+                    time.sleep(0.5)
+                    _click_primary_auth_button(page, pwd_field, ["Continue", "缁х画", "Log in"])
+                    time.sleep(5)
+                    _screenshot(page, f"codex_04_password_{step + 1}.png")
+                    continue
+            except Exception:
+                pass
+
+            try:
+                if _is_otp_input_visible(page, timeout=2000) and mail_client:
+                    submit_status = _resolve_email_verification(
+                        page,
+                        mail_client=mail_client,
+                        email=email,
+                        after_email_id=email_id_before_login,
+                        used_email_ids=used_email_ids,
+                        wait_log=f"[Codex] Waiting for consent code (step {step + 1}, %s skipped messages)...",
+                        require_sender=True,
+                    )
+                    if submit_status == "accepted":
+                        continue
+            except Exception:
+                pass
+
+            if "about-you" in page.url:
+                _complete_oauth_about_you(page, signup_profile)
+                continue
+
+            try:
+                consent_btn = page.locator(
+                    'button:has-text("缁х画"), button:has-text("Continue"), button:has-text("Allow")'
+                ).first
+                if consent_btn.is_visible(timeout=5000):
+                    previous_url = page.url
+                    consent_btn.click()
+                    failure = _wait_for_oauth_page_progress(page, previous_url=previous_url, timeout=5)
+                    _screenshot(page, f"codex_04_consent_{step + 1}.png")
+                    auth_code = auth_code or _capture_auth_code_from_page(page)
+                    if not auth_code:
+                        auth_code = _follow_oauth_redirect_chain(
+                            context,
+                            getattr(page, "url", "") or previous_url,
+                            referer=previous_url,
+                        )
+                    if failure:
+                        failure_result = failure
+                        break
+                    if auth_code:
+                        break
+                else:
+                    time.sleep(1)
+                    continue
+            except Exception as exc:
+                auth_code = auth_code or _extract_auth_code_from_exception(exc)
+                if auth_code:
+                    break
+                time.sleep(1)
+                continue
+
+        if not auth_code:
+            auth_code = _capture_auth_code_from_page(page)
+        if not auth_code:
+            auth_code = _follow_oauth_redirect_chain(context, getattr(page, "url", ""), referer=auth_url)
+
+        for attempt in range(30):
+            if auth_code:
+                break
+            auth_code = _capture_auth_code_from_page(page)
+            if auth_code:
+                break
+            try:
+                current_url = page.url
+                auth_code = _extract_auth_code(current_url)
+                if auth_code:
+                    logger.info("[Codex] Captured auth code from URL")
+                    break
+                if attempt in (4, 14, 24):
+                    auth_code = _follow_oauth_redirect_chain(context, current_url, referer=auth_url)
+                    if auth_code:
+                        break
+            except Exception as exc:
+                auth_code = auth_code or _extract_auth_code_from_exception(exc)
+                if auth_code:
+                    break
+            time.sleep(1)
+
+        if not auth_code:
+            _screenshot(page, "codex_05_no_callback.png")
+            body_excerpt = _page_excerpt(page)
+            logger.warning("[Codex] No auth code; URL: %s", page.url)
+            failure_result = _build_oauth_failure_result(page.url, body_excerpt)
+
+        browser.close()
+
+    if not auth_code:
+        detail = failure_result.get("error_detail") if isinstance(failure_result, dict) else "Missing authorization code"
+        logger.error("[Codex] OAuth login failed: %s", detail)
+        if return_result:
+            return failure_result or {
+                "ok": False,
+                "bundle": None,
+                "error_type": "auth_code_missing",
+                "error_detail": "Missing authorization code",
+                "retryable": True,
+            }
+        return None
+
+    bundle = _exchange_auth_code(auth_code, code_verifier, fallback_email=email)
+    if bundle:
+        plan_type = str(bundle.get("plan_type") or "").lower()
+        if plan_type != "team":
+            detail = f"plan={plan_type or 'unknown'} is not Team"
+            logger.error("[Codex] OAuth login failed: %s", detail)
+            if return_result:
+                return {
+                    "ok": False,
+                    "bundle": None,
+                    "error_type": "non_team_plan",
+                    "error_detail": detail,
+                    "retryable": True,
+                }
+            return None
+
+    if return_result:
+        if bundle:
+            return {"ok": True, "bundle": bundle, "error_type": None, "error_detail": None, "retryable": False}
+        return {
+            "ok": False,
+            "bundle": None,
+            "error_type": "token_exchange_failed",
+            "error_detail": "Token exchange failed",
+            "retryable": True,
+        }
+    return bundle
+
+
 def login_codex_via_browser(
+    email, password, mail_client=None, *, return_result=False, signup_profile: SignupProfile | None = None
+):
+    return _login_codex_via_browser_direct(
+        email,
+        password,
+        mail_client=mail_client,
+        return_result=return_result,
+        signup_profile=signup_profile,
+    )
+
+
+def _legacy_login_codex_via_browser(
     email, password, mail_client=None, *, return_result=False, signup_profile: SignupProfile | None = None
 ):
     """

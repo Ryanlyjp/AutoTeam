@@ -1,3 +1,5 @@
+import requests
+
 from autoteam import codex_auth
 
 
@@ -229,6 +231,51 @@ def test_classify_oauth_failure_detects_choose_account_page():
     assert error_type == "choose_account_selection"
     assert detail == "卡在账号选择页"
     assert retryable is True
+
+
+def test_extract_auth_code_reads_callback_url():
+    code = codex_auth._extract_auth_code("http://localhost:1455/auth/callback?code=abc123&state=xyz")
+
+    assert code == "abc123"
+
+
+def test_capture_auth_code_from_page_checks_frame_urls():
+    frame = type("Frame", (), {"url": "http://localhost:1455/auth/callback?code=frame-code"})()
+    page = type("Page", (), {"url": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent", "frames": [frame]})()
+
+    assert codex_auth._capture_auth_code_from_page(page) == "frame-code"
+
+
+def test_follow_oauth_redirect_chain_uses_redirect_location(monkeypatch):
+    calls = []
+
+    class FakeContext:
+        def cookies(self, urls):
+            calls.append(tuple(urls))
+            return [{"name": "session", "value": "cookie-value"}]
+
+    class FakeResponse:
+        def __init__(self, status_code, headers=None, url=""):
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.url = url
+
+    class FakeSession:
+        def get(self, url, headers=None, allow_redirects=False, timeout=0):
+            assert allow_redirects is False
+            assert headers["Cookie"] == "session=cookie-value"
+            return FakeResponse(302, {"location": "http://localhost:1455/auth/callback?code=redirect-code"}, url=url)
+
+    monkeypatch.setattr(requests, "Session", lambda: FakeSession())
+
+    code = codex_auth._follow_oauth_redirect_chain(
+        FakeContext(),
+        "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        referer="https://auth.openai.com/oauth/authorize",
+    )
+
+    assert code == "redirect-code"
+    assert calls == [("https://auth.openai.com/sign-in-with-chatgpt/codex/consent",)]
 
 
 def test_select_oauth_account_clicks_matching_email_and_continue():

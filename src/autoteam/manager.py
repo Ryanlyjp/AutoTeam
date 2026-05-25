@@ -1747,6 +1747,64 @@ def _wait_for_direct_otp_input(page, timeout=25):
     return "ready" if _is_direct_otp_input_visible(page, timeout=300) else _detect_direct_register_step(page)
 
 
+_DIRECT_OTP_INVALID_HINTS = (
+    "invalid code",
+    "incorrect code",
+    "wrong code",
+    "expired code",
+    "check the code and try again",
+)
+
+
+def _detect_direct_otp_error(page):
+    try:
+        body = page.locator("body").inner_text(timeout=1500).lower().replace("\n", " ")
+    except Exception:
+        return None
+
+    for hint in _DIRECT_OTP_INVALID_HINTS:
+        if hint in body:
+            return hint
+    return None
+
+
+def _wait_for_direct_otp_submit_result(page, timeout=12):
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        current_url = (getattr(page, "url", "") or "").lower()
+        if current_url and "email-verification" not in current_url:
+            return "accepted", _detect_direct_register_step(page)
+
+        err = _detect_direct_otp_error(page)
+        if err:
+            return "invalid", err
+
+        if not _is_direct_otp_input_visible(page, timeout=250):
+            return "accepted", _detect_direct_register_step(page)
+
+        time.sleep(0.5)
+
+    err = _detect_direct_otp_error(page)
+    if err:
+        return "invalid", err
+    return "pending", _detect_direct_register_step(page)
+
+
+def _direct_registration_succeeded(page, email, *, team_check_attempts=3, team_check_interval=2):
+    current_url = getattr(page, "url", "") or ""
+    if "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page):
+        return True
+
+    total_attempts = max(0, int(team_check_attempts))
+    for attempt in range(total_attempts):
+        if _is_email_in_team(email):
+            return True
+        if team_check_interval > 0 and attempt + 1 < total_attempts:
+            time.sleep(team_check_interval)
+    return False
+
+
 def _wait_for_direct_verification_code(mail_client, email, *, mail_account_id=None, timeout=MAIL_TIMEOUT):
     if getattr(mail_client, "provider_name", "") == "tempmail" and hasattr(mail_client, "wait_for_otp"):
         return mail_client.wait_for_otp(
@@ -2340,8 +2398,18 @@ def _register_direct_once(
                     page.keyboard.press("Enter")
                 except Exception:
                     pass
-            next_step = _wait_for_direct_step_change(page, "code", timeout=15)
+            submit_status, _submit_detail = _wait_for_direct_otp_submit_result(page, timeout=15)
+            next_step = _detect_direct_register_step(page)
+            if submit_status == "accepted" and next_step == "code":
+                next_step = _wait_for_direct_step_change(page, "code", timeout=15)
+            elif submit_status == "pending" and next_step == "code":
+                next_step = _wait_for_direct_step_change(page, "code", timeout=20)
             logger.info("[直接注册] 提交验证码后状态: %s | URL: %s", next_step, page.url)
+            if submit_status == "invalid":
+                logger.warning("[direct-register] invalid verification code | URL: %s | body=%s", page.url, _page_excerpt(page))
+                _safe_invite_screenshot(page, "direct_05_invalid_code.png")
+                browser.close()
+                return False
             time.sleep(2)
 
         _safe_invite_screenshot(page, "direct_05_after_code.png")
@@ -2366,7 +2434,7 @@ def _register_direct_once(
         _safe_invite_screenshot(page, "direct_07_final.png")
 
         current_url = page.url
-        success = "chatgpt.com" in current_url and "auth" not in current_url and not _is_google_redirect(page)
+        success = _direct_registration_succeeded(page, email)
         if success:
             logger.info("[直接注册] 注册成功并已加入 workspace!")
         else:

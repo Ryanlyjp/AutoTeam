@@ -194,6 +194,22 @@ class _DirectFlowPage:
         return _FakeLocatorGroup([])
 
 
+class _DirectOtpPage:
+    def __init__(self, *, url="https://auth.openai.com/email-verification", body="", otp_visible=True):
+        self.url = url
+        self._body = body
+        self._otp_input = _FakeElement(visible=otp_visible, editable=True)
+
+    def locator(self, selector):
+        if selector == "body":
+            return _FakeLocatorGroup(text=self._body)
+        if selector == manager._DIRECT_OTP_SINGLE_INPUT_SELECTORS:
+            return _FakeLocatorGroup([])
+        if selector == manager._DIRECT_CODE_SELECTORS:
+            return _FakeLocatorGroup([self._otp_input])
+        return _FakeLocatorGroup([])
+
+
 def test_fill_about_you_birthday_by_meta_uses_profile_values(monkeypatch):
     monkeypatch.setattr(manager.time, "sleep", lambda *_args, **_kwargs: None)
     profile = SignupProfile("Ethan Carter", 1988, 7, 14, 37)
@@ -230,6 +246,25 @@ def test_detect_direct_register_step_recognizes_auth_error_page():
     page.url = "https://chatgpt.com/api/auth/error"
 
     assert manager._detect_direct_register_step(page) == "error"
+
+
+def test_wait_for_direct_otp_submit_result_accepts_when_url_leaves_email_verification():
+    page = _DirectOtpPage(url="https://chatgpt.com/")
+
+    status, detail = manager._wait_for_direct_otp_submit_result(page, timeout=0.1)
+
+    assert status == "accepted"
+    assert detail == "completed"
+
+
+def test_direct_registration_succeeded_accepts_team_membership_when_browser_url_stalls(monkeypatch):
+    page = _DirectFlowPage()
+    page.url = "https://auth.openai.com/email-verification"
+
+    monkeypatch.setattr(manager.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager, "_is_email_in_team", lambda email: email == "user@example.com")
+
+    assert manager._direct_registration_succeeded(page, "user@example.com") is True
 
 
 def test_register_direct_once_fails_fast_when_email_step_hits_auth_error(monkeypatch):
