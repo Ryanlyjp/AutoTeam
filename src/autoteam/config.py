@@ -224,20 +224,15 @@ def get_chatgpt_http_proxy_url() -> str:
 
 
 def _build_easyproxy_browser_proxy():
-    from autoteam import easyproxy
-
     if not EASYPROXY_ENABLED:
         return None
+    if EASYPROXY_MASTER_MODE != "follow_pool":
+        return None
 
-    assignment = easyproxy.select_proxy_assignment(env=os.environ)
-    proxy = {"server": assignment["proxy_url"]}
+    proxy = {"server": get_easyproxy_pool_proxy_url()}
     if PLAYWRIGHT_PROXY_BYPASS:
         proxy["bypass"] = PLAYWRIGHT_PROXY_BYPASS
-    logger.info(
-        "[EasyProxy] 浏览器随机选择端口 %s (%s)",
-        assignment["port"],
-        assignment.get("tag") or assignment.get("name") or "-",
-    )
+    logger.info("[EasyProxy] 浏览器走池化端口 %s", proxy["server"])
     return proxy
 
 
