@@ -28,8 +28,8 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
     monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
     monkeypatch.setattr(
         manager,
-        "_is_email_in_team",
-        lambda email: (_ for _ in ()).throw(AssertionError("should not check team membership separately")),
+        "_confirm_reinvite_team_membership",
+        lambda email, *, chatgpt_api=None, attempts=2, delay=5: True,
     )
 
     result = manager.reinvite_account(
@@ -50,6 +50,47 @@ def test_reinvite_account_uses_unified_oauth_login_and_marks_active(monkeypatch)
         ),
         ("tmp-user@example.com", {"_auth_repair_reset": True}),
     ]
+
+
+def test_reinvite_account_marks_standby_when_team_membership_is_not_confirmed(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        manager,
+        "login_codex_via_browser",
+        lambda email, password, mail_client=None: {
+            "email": email,
+            "access_token": "token-1",
+            "refresh_token": "refresh-1",
+            "plan_type": "team",
+        },
+    )
+    monkeypatch.setattr(
+        manager,
+        "_confirm_reinvite_team_membership",
+        lambda email, *, chatgpt_api=None, attempts=2, delay=5: False,
+    )
+
+    def fake_record(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"status": accounts.STATUS_STANDBY}
+
+    monkeypatch.setattr(manager, "_record_auth_repair_failure", fake_record)
+
+    result = manager.reinvite_account(
+        types.SimpleNamespace(browser=False),
+        None,
+        {"email": "tmp-user@example.com", "password": "secret"},
+    )
+
+    assert result is False
+    assert captured["args"][:3] == (
+        "tmp-user@example.com",
+        "login_failed",
+        "team membership not confirmed",
+    )
+    assert captured["kwargs"]["release_team_seat"] is True
 
 
 def test_reinvite_account_marks_standby_when_oauth_login_returns_non_team(monkeypatch):

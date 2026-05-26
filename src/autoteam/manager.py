@@ -1539,6 +1539,35 @@ def _is_email_in_team(email):
             chatgpt.stop()
 
 
+def _confirm_reinvite_team_membership(email: str, *, chatgpt_api=None, attempts: int = 2, delay: int = 5) -> bool:
+    managed_chatgpt = chatgpt_api
+    owns_chatgpt = managed_chatgpt is None
+    total_attempts = max(1, int(attempts))
+    wait_seconds = max(0, int(delay))
+
+    try:
+        if managed_chatgpt is None:
+            managed_chatgpt = ChatGPTTeamAPI()
+
+        for attempt in range(total_attempts):
+            if attempt > 0 and wait_seconds > 0:
+                time.sleep(wait_seconds)
+
+            if not _chatgpt_session_ready(managed_chatgpt):
+                managed_chatgpt.start()
+
+            members, _ = fetch_team_state(managed_chatgpt)
+            if any((m.get("email", "") or "").lower() == email.lower() for m in members):
+                return True
+        return False
+    except Exception as exc:
+        logger.warning("[reinvite] team confirm failed for %s: %s", email, exc)
+        return False
+    finally:
+        if owns_chatgpt and _chatgpt_session_ready(managed_chatgpt):
+            managed_chatgpt.stop()
+
+
 _DIRECT_EMAIL_SELECTORS = (
     'input[name="email"], input[type="email"], input[id="email"], '
     'input[autocomplete="email"], input[autocomplete="username"], '
@@ -2591,6 +2620,18 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             release_team_seat=True,
         )
         logger.warning("[轮转] 旧账号保持状态为 %s: %s", result.get("status"), email)
+        return False
+
+    if not _confirm_reinvite_team_membership(email, chatgpt_api=chatgpt_api, attempts=2, delay=5):
+        logger.warning("[reinvite] team membership not confirmed after OAuth: %s", email)
+        result = _record_auth_repair_failure(
+            email,
+            "login_failed",
+            "team membership not confirmed",
+            chatgpt_api=chatgpt_api,
+            release_team_seat=True,
+        )
+        logger.warning("[reinvite] old account remains %s: %s", result.get("status"), email)
         return False
 
     auth_file = save_auth_file(bundle)
