@@ -1509,6 +1509,47 @@ class ChatGPTTeamAPI:
             self._ensure_browser_session()
         return self._browser_api_fetch(method, path, body)
 
+    def get_identity(self):
+        path = f"/backend-api/accounts/{self.account_id}/identity"
+        result = self._api_fetch("GET", path)
+        if result["status"] != 200:
+            raise RuntimeError(f"get_identity HTTP {result['status']}: {result['body'][:200]}")
+        try:
+            return json.loads(result["body"] or "{}")
+        except Exception as exc:
+            raise RuntimeError(f"get_identity invalid JSON: {exc}") from exc
+
+    def get_auto_provision(self):
+        identity = self.get_identity()
+        for key_path in (
+            ("auto_provision",),
+            ("settings", "auto_provision"),
+            ("automatic_account_creation",),
+        ):
+            current = identity
+            for key in key_path:
+                if not isinstance(current, dict):
+                    current = None
+                    break
+                current = current.get(key)
+            if isinstance(current, bool):
+                return current
+            if isinstance(current, dict) and isinstance(current.get("value"), bool):
+                return current["value"]
+        return None
+
+    def set_auto_provision(self, value):
+        path = f"/backend-api/accounts/{self.account_id}/settings/auto_provision"
+        result = self._api_fetch("POST", path, {"value": bool(value)})
+        if result["status"] != 200:
+            raise RuntimeError(f"set_auto_provision HTTP {result['status']}: {result['body'][:200]}")
+        try:
+            data = json.loads(result["body"] or "{}")
+        except Exception:
+            data = {}
+        logger.info("[ChatGPT] auto-provision -> %s", bool(value))
+        return data
+
     def invite_member(self, email, seat_type="usage_based"):
         path = f"/backend-api/accounts/{self.account_id}/invites"
         body = {

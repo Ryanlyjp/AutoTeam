@@ -26,6 +26,7 @@ def test_login_codex_via_session_uses_unified_flow_and_returns_bundle(monkeypatc
     monkeypatch.setattr(codex_auth, "get_admin_session_token", lambda: "session-token")
     monkeypatch.setattr(codex_auth, "get_chatgpt_account_id", lambda: "acc-1")
     monkeypatch.setattr(codex_auth, "get_chatgpt_workspace_name", lambda: "Idapro")
+    monkeypatch.setattr(codex_auth, "_ensure_auto_provision_enabled", lambda: False)
 
     bundle = codex_auth.login_codex_via_session()
 
@@ -61,6 +62,7 @@ def test_login_codex_via_session_returns_none_when_flow_requires_more_steps(monk
     monkeypatch.setattr(codex_auth, "get_admin_session_token", lambda: "session-token")
     monkeypatch.setattr(codex_auth, "get_chatgpt_account_id", lambda: "acc-1")
     monkeypatch.setattr(codex_auth, "get_chatgpt_workspace_name", lambda: "Idapro")
+    monkeypatch.setattr(codex_auth, "_ensure_auto_provision_enabled", lambda: False)
 
     bundle = codex_auth.login_codex_via_session()
 

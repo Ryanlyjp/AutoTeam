@@ -35,6 +35,8 @@ CODEX_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CALLBACK_PORT = 1455
 CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
+AUTH_OPENAI_ORIGIN = "https://auth.openai.com"
+AUTO_PROVISION_PROPAGATION_DELAY = 5
 _EARLY_OAUTH_BLOCK_FAILURE_TYPES = {"add_phone", "human_verification", "site_unavailable"}
 
 
@@ -908,6 +910,15 @@ def _capture_auth_code_from_page(page) -> str | None:
         code = _extract_auth_code(getattr(frame, "url", ""))
         if code:
             return code
+
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    callback_url = _extract_callback_url(html)
+    if callback_url:
+        return _extract_auth_code(callback_url)
     return None
 
 
@@ -924,6 +935,253 @@ def _build_context_cookie_header(context, url: str) -> str:
             continue
         parts.append(f"{name}={cookie.get('value', '')}")
     return "; ".join(parts)
+
+
+def _absolute_auth_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("/"):
+        return f"{AUTH_OPENAI_ORIGIN}{raw}"
+    return raw
+
+
+def _decode_oauth_session_from_context(context) -> dict | None:
+    try:
+        cookies = context.cookies([AUTH_OPENAI_ORIGIN, CODEX_AUTH_URL])
+    except Exception:
+        return None
+
+    for cookie in cookies or []:
+        name = str(cookie.get("name") or "").strip()
+        if "oai-client-auth-session" not in name:
+            continue
+
+        raw = str(cookie.get("value") or "").strip()
+        if not raw:
+            continue
+
+        for candidate in (raw, urllib.parse.unquote(raw)):
+            try:
+                value = candidate
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    value = value[1:-1]
+                payload = value.split(".", 1)[0]
+                payload += "=" * ((4 - len(payload) % 4) % 4)
+                data = json.loads(base64.urlsafe_b64decode(payload).decode())
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+    return None
+
+
+def _workspace_looks_personal(workspace: dict) -> bool:
+    if not isinstance(workspace, dict):
+        return False
+    if workspace.get("is_personal") is True:
+        return True
+
+    plan_type = str(workspace.get("plan_type") or "").strip().lower()
+    structure = str(workspace.get("structure") or "").strip().lower()
+    label = " ".join(
+        str(workspace.get(key) or "").strip().lower() for key in ("workspace_name", "name", "label", "display_name")
+    ).strip()
+    return (
+        plan_type == "free"
+        or structure.startswith("personal")
+        or "personal account" in label
+        or label == "personal"
+    )
+
+
+def _select_target_team_workspace(session_data: dict | None, *, workspace_name: str = "", account_id: str = "") -> dict | None:
+    workspaces = session_data.get("workspaces") if isinstance(session_data, dict) else None
+    if not isinstance(workspaces, list):
+        return None
+
+    preferred_id = str(account_id or "").strip().lower()
+    preferred_name = str(workspace_name or "").strip().lower()
+    normalized = [item for item in workspaces if isinstance(item, dict) and item.get("id")]
+    if not normalized:
+        return None
+
+    if preferred_id:
+        for workspace in normalized:
+            if str(workspace.get("id") or "").strip().lower() == preferred_id:
+                return workspace
+
+    if preferred_name:
+        for workspace in normalized:
+            for key in ("workspace_name", "name", "label", "display_name"):
+                label = str(workspace.get(key) or "").strip().lower()
+                if label and label == preferred_name:
+                    return workspace
+
+    for workspace in normalized:
+        if not _workspace_looks_personal(workspace):
+            return workspace
+
+    return normalized[0]
+
+
+def _oauth_request_headers(context, url: str, *, referer: str | None = None, accept: str = "application/json, text/plain, */*"):
+    target = _absolute_auth_url(url) or AUTH_OPENAI_ORIGIN
+    referer_value = _absolute_auth_url(referer or target) or AUTH_OPENAI_ORIGIN
+    headers = {
+        "Accept": accept,
+        "Content-Type": "application/json",
+        "Origin": AUTH_OPENAI_ORIGIN,
+        "Referer": referer_value,
+    }
+    cookie_header = _build_context_cookie_header(context, target)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers
+
+
+def _extract_continue_url(payload) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    return _absolute_auth_url(payload.get("continue_url") or "")
+
+
+def _follow_oauth_continue_url(context, url: str, *, referer: str | None = None) -> str | None:
+    target = _absolute_auth_url(url)
+    if not target:
+        return None
+    code = _extract_auth_code(target)
+    if code:
+        return code
+    return _follow_oauth_redirect_chain(context, target, referer=referer or target)
+
+
+def _continue_oauth_via_api(page, context, workspace_name: str = "", account_id: str = "") -> str | None:
+    session_data = _decode_oauth_session_from_context(context)
+    workspace = _select_target_team_workspace(
+        session_data,
+        workspace_name=workspace_name,
+        account_id=account_id,
+    )
+    if not workspace:
+        return None
+
+    import requests
+
+    consent_url = _absolute_auth_url(getattr(page, "url", "")) or f"{AUTH_OPENAI_ORIGIN}/sign-in-with-chatgpt/codex/consent"
+    session = requests.Session()
+
+    def _post(url: str, payload: dict, *, referer: str):
+        return session.post(
+            url,
+            headers=_oauth_request_headers(context, url, referer=referer),
+            json=payload,
+            allow_redirects=False,
+            timeout=20,
+        )
+
+    try:
+        response = _post(
+            f"{AUTH_OPENAI_ORIGIN}/api/accounts/workspace/select",
+            {"workspace_id": workspace["id"]},
+            referer=consent_url,
+        )
+    except Exception:
+        return None
+
+    location = _absolute_auth_url(response.headers.get("location") or "")
+    if response.status_code in (301, 302, 303, 307, 308) and location:
+        return _follow_oauth_continue_url(context, location, referer=consent_url)
+
+    try:
+        payload = response.json() if response.status_code == 200 else {}
+    except Exception:
+        payload = {}
+
+    if response.status_code != 200:
+        return None
+
+    next_url = _extract_continue_url(payload)
+    orgs = ((payload.get("data") or {}).get("orgs")) if isinstance(payload, dict) else None
+    if isinstance(orgs, list) and orgs:
+        org = orgs[0] if isinstance(orgs[0], dict) else {}
+        org_id = str(org.get("id") or "").strip()
+        if org_id:
+            org_payload = {"org_id": org_id}
+            projects = org.get("projects") or []
+            if isinstance(projects, list) and projects:
+                project_id = str((projects[0] or {}).get("id") or "").strip()
+                if project_id:
+                    org_payload["project_id"] = project_id
+            org_referer = next_url or consent_url
+            try:
+                response = _post(
+                    f"{AUTH_OPENAI_ORIGIN}/api/accounts/organization/select",
+                    org_payload,
+                    referer=org_referer,
+                )
+            except Exception:
+                return _follow_oauth_continue_url(context, next_url, referer=consent_url)
+
+            location = _absolute_auth_url(response.headers.get("location") or "")
+            if response.status_code in (301, 302, 303, 307, 308) and location:
+                return _follow_oauth_continue_url(context, location, referer=org_referer)
+
+            try:
+                payload = response.json() if response.status_code == 200 else {}
+            except Exception:
+                payload = {}
+            if response.status_code == 200:
+                next_url = _extract_continue_url(payload) or next_url
+
+    return _follow_oauth_continue_url(context, next_url, referer=consent_url)
+
+
+def _resolve_auth_code_after_consent(
+    page,
+    context,
+    *,
+    workspace_name: str = "",
+    account_id: str = "",
+    referer: str | None = None,
+):
+    code = _capture_auth_code_from_page(page)
+    if code:
+        return code
+
+    current_url = _absolute_auth_url(getattr(page, "url", ""))
+    if not any(token in current_url.lower() for token in ("consent", "workspace", "organization")):
+        return None
+
+    code = _continue_oauth_via_api(page, context, workspace_name=workspace_name, account_id=account_id)
+    if code:
+        logger.info("[Codex] Captured auth code")
+        return code
+
+    code = _follow_oauth_redirect_chain(context, current_url, referer=referer or current_url)
+    if code:
+        logger.info("[Codex] Captured auth code")
+    return code
+
+
+def _ensure_auto_provision_enabled() -> bool:
+    from autoteam.chatgpt_api import ChatGPTTeamAPI
+
+    client = ChatGPTTeamAPI()
+    try:
+        client.start()
+        enabled = client.get_auto_provision()
+        if enabled is True:
+            return False
+        logger.info("[Codex] Enable auto-provision before OAuth")
+        client.set_auto_provision(True)
+        time.sleep(AUTO_PROVISION_PROPAGATION_DELAY)
+        return True
+    except Exception as exc:
+        logger.warning("[Codex] Auto-provision precheck failed: %s", exc)
+        return False
+    finally:
+        client.stop()
 
 
 def _follow_oauth_redirect_chain(context, start_url: str, *, referer: str | None = None, max_hops: int = 8) -> str | None:
@@ -1127,6 +1385,7 @@ def _login_codex_via_browser_direct(
         if "about-you" in page.url:
             _complete_oauth_about_you(page, signup_profile)
 
+        workspace_name = get_chatgpt_workspace_name()
         for step in range(10):
             if auth_code:
                 break
@@ -1168,6 +1427,15 @@ def _login_codex_via_browser_direct(
                                 failure = _wait_for_oauth_page_progress(page, previous_url=previous_url, timeout=3)
                                 if failure:
                                     failure_result = failure
+                                    break
+                                auth_code = auth_code or _resolve_auth_code_after_consent(
+                                    page,
+                                    context,
+                                    workspace_name=workspace_name,
+                                    account_id=chatgpt_account_id,
+                                    referer=previous_url,
+                                )
+                                if auth_code:
                                     break
                         except Exception:
                             pass
@@ -1218,9 +1486,11 @@ def _login_codex_via_browser_direct(
                     _screenshot(page, f"codex_04_consent_{step + 1}.png")
                     auth_code = auth_code or _capture_auth_code_from_page(page)
                     if not auth_code:
-                        auth_code = _follow_oauth_redirect_chain(
+                        auth_code = _resolve_auth_code_after_consent(
+                            page,
                             context,
-                            getattr(page, "url", "") or previous_url,
+                            workspace_name=workspace_name,
+                            account_id=chatgpt_account_id,
                             referer=previous_url,
                         )
                     if failure:
@@ -1241,6 +1511,14 @@ def _login_codex_via_browser_direct(
         if not auth_code:
             auth_code = _capture_auth_code_from_page(page)
         if not auth_code:
+            auth_code = _resolve_auth_code_after_consent(
+                page,
+                context,
+                workspace_name=get_chatgpt_workspace_name(),
+                account_id=chatgpt_account_id,
+                referer=auth_url,
+            )
+        if not auth_code:
             auth_code = _follow_oauth_redirect_chain(context, getattr(page, "url", ""), referer=auth_url)
 
         for attempt in range(30):
@@ -1256,7 +1534,15 @@ def _login_codex_via_browser_direct(
                     logger.info("[Codex] Captured auth code from URL")
                     break
                 if attempt in (4, 14, 24):
-                    auth_code = _follow_oauth_redirect_chain(context, current_url, referer=auth_url)
+                    auth_code = _resolve_auth_code_after_consent(
+                        page,
+                        context,
+                        workspace_name=get_chatgpt_workspace_name(),
+                        account_id=chatgpt_account_id,
+                        referer=auth_url,
+                    )
+                    if not auth_code:
+                        auth_code = _follow_oauth_redirect_chain(context, current_url, referer=auth_url)
                     if auth_code:
                         break
             except Exception as exc:
@@ -1318,6 +1604,7 @@ def _login_codex_via_browser_direct(
 def login_codex_via_browser(
     email, password, mail_client=None, *, return_result=False, signup_profile: SignupProfile | None = None
 ):
+    _ensure_auto_provision_enabled()
     return _login_codex_via_browser_direct(
         email,
         password,
@@ -1815,6 +2102,8 @@ def _legacy_login_codex_via_browser(
 def login_codex_via_session():
     """使用管理员 session 复用统一流程完成主号 Codex OAuth 登录。"""
     logger.info("[Codex] 开始使用 session 登录主号 Codex...")
+
+    _ensure_auto_provision_enabled()
 
     flow = SessionCodexAuthFlow(
         email=get_admin_email(),
