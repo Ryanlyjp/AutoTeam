@@ -351,9 +351,11 @@ _CHOOSE_ACCOUNT_IGNORE_SUBSTRINGS = (
 
 def _is_otp_input_visible(page, timeout=500):
     try:
-        return page.locator(_OTP_INPUT_SELECTORS).first.is_visible(timeout=timeout)
+        if page.locator(_OTP_INPUT_SELECTORS).first.is_visible(timeout=timeout):
+            return True
     except Exception:
-        return False
+        pass
+    return bool(_visible_otp_slot_inputs(page, timeout=timeout))
 
 
 def _detect_otp_error(page):
@@ -376,16 +378,24 @@ def _wait_for_otp_submit_result(page, timeout=12):
     - pending: 既没报错也没明显前进（常见于页面较慢或状态未稳定）
     """
     deadline = time.time() + timeout
+    otp_hidden_since = None
 
     while time.time() < deadline:
         current_url = (getattr(page, "url", "") or "").lower()
         if current_url and "email-verification" not in current_url:
             return "accepted", None
+        if _capture_auth_code_from_page(page):
+            return "accepted", None
         err = _detect_otp_error(page)
         if err:
             return "invalid", err
         if not _is_otp_input_visible(page, timeout=250):
-            return "accepted", None
+            if otp_hidden_since is None:
+                otp_hidden_since = time.time()
+            elif time.time() - otp_hidden_since >= 1.5:
+                return "accepted", None
+        else:
+            otp_hidden_since = None
         time.sleep(0.5)
 
     err = _detect_otp_error(page)
@@ -431,10 +441,10 @@ def _fill_otp_code(page, code: str) -> bool:
             except Exception:
                 pass
             try:
-                loc.fill(char)
+                loc.type(char, delay=50)
             except Exception:
                 try:
-                    loc.type(char, delay=50)
+                    loc.fill(char)
                 except Exception:
                     try:
                         page.keyboard.type(char, delay=50)
@@ -446,7 +456,14 @@ def _fill_otp_code(page, code: str) -> bool:
     try:
         otp_input = page.locator(_OTP_INPUT_SELECTORS).first
         if otp_input.is_visible(timeout=2000):
-            otp_input.fill(value)
+            try:
+                otp_input.fill("")
+            except Exception:
+                pass
+            try:
+                otp_input.type(value, delay=50)
+            except Exception:
+                otp_input.fill(value)
             return True
     except Exception:
         pass
@@ -469,6 +486,33 @@ def _click_otp_submit_button(page) -> bool:
         except Exception:
             continue
     return False
+
+
+def _submit_otp_code(page) -> bool:
+    if _click_otp_submit_button(page):
+        return True
+
+    try:
+        otp_input = page.locator(_OTP_INPUT_SELECTORS).first
+        if otp_input.is_visible(timeout=300):
+            otp_input.press("Enter")
+            return True
+    except Exception:
+        pass
+
+    slot_inputs = _visible_otp_slot_inputs(page, timeout=150)
+    if slot_inputs:
+        try:
+            slot_inputs[-1].press("Enter")
+            return True
+        except Exception:
+            pass
+
+    try:
+        page.keyboard.press("Enter")
+        return True
+    except Exception:
+        return False
 
 
 def _poll_mail_verification_code(
@@ -558,7 +602,7 @@ def _resolve_email_verification(
             return "input_unavailable"
 
         time.sleep(0.5)
-        _click_otp_submit_button(page)
+        _submit_otp_code(page)
         logger.info("[Codex] 已输入验证码: %s", otp)
 
         submit_status, submit_detail = _wait_for_otp_submit_result(page, timeout=submit_timeout)

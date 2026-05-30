@@ -318,6 +318,7 @@ class _FakeOtpInput:
         self.visible = visible
         self.filled_values = []
         self.clicked = False
+        self.pressed = []
 
     def is_visible(self, timeout=0):
         return self.visible
@@ -330,6 +331,9 @@ class _FakeOtpInput:
 
     def type(self, value, delay=0):
         self.filled_values.append(value)
+
+    def press(self, key):
+        self.pressed.append(key)
 
 
 class _FakeOtpCollection:
@@ -355,9 +359,13 @@ class _FakeOtpCollection:
 class _FakeKeyboard:
     def __init__(self):
         self.typed = []
+        self.pressed = []
 
     def type(self, value, delay=0):
         self.typed.append(value)
+
+    def press(self, key):
+        self.pressed.append(key)
 
 
 class _FakeOtpPage:
@@ -395,6 +403,12 @@ def test_fill_otp_code_uses_single_char_inputs():
     assert [slot.filled_values[-1] for slot in slots] == list("481556")
 
 
+def test_is_otp_input_visible_detects_single_char_inputs():
+    page = _FakeOtpPage(slot_inputs=[_FakeOtpInput() for _ in range(6)])
+
+    assert codex_auth._is_otp_input_visible(page) is True
+
+
 def test_wait_for_otp_submit_result_accepts_when_url_leaves_email_verification():
     page = _FakeOtpPage(url="https://auth.openai.com/workspace", otp_input=_FakeOtpInput(visible=True))
 
@@ -402,6 +416,28 @@ def test_wait_for_otp_submit_result_accepts_when_url_leaves_email_verification()
 
     assert status == "accepted"
     assert detail is None
+
+
+def test_wait_for_otp_submit_result_keeps_waiting_while_single_char_inputs_remain(monkeypatch):
+    page = _FakeOtpPage(slot_inputs=[_FakeOtpInput() for _ in range(6)])
+    clock = {"now": 0.0}
+
+    monkeypatch.setattr(codex_auth.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds))
+
+    status, detail = codex_auth._wait_for_otp_submit_result(page, timeout=1.0)
+
+    assert status == "pending"
+    assert detail is None
+
+
+def test_submit_otp_code_falls_back_to_enter_on_last_slot():
+    slots = [_FakeOtpInput() for _ in range(6)]
+    page = _FakeOtpPage(slot_inputs=slots)
+    page.submit_button.visible = False
+
+    assert codex_auth._submit_otp_code(page) is True
+    assert slots[-1].pressed == ["Enter"]
 
 
 def test_resolve_email_verification_marks_used_email_after_success(monkeypatch):
