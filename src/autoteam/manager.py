@@ -2465,6 +2465,34 @@ def _register_direct_once(
         return success
 
 
+def _discard_direct_register_attempt(email: str, account_id, mail_client, *, added_to_pool: bool = False) -> None:
+    cleanup = {}
+
+    try:
+        cleanup = delete_managed_account(
+            email,
+            remove_remote=True,
+            remove_cloudmail=bool(added_to_pool),
+            sync_cpa_after=False,
+            mail_client=mail_client if added_to_pool else None,
+        )
+    except Exception as exc:
+        logger.warning("[direct-register] cleanup failed for %s: %s", email, exc)
+
+    if cleanup.get("cloudmail_deleted"):
+        return
+
+    if account_id is None or mail_client is None:
+        return
+
+    try:
+        delete_resp = mail_client.delete_account(account_id)
+        if isinstance(delete_resp, dict) and delete_resp.get("code") != 200:
+            logger.warning("[direct-register] delete temp mailbox failed: %s", delete_resp.get("message") or delete_resp)
+    except Exception as delete_exc:
+        logger.warning("[direct-register] delete temp mailbox failed: %s", delete_exc)
+
+
 def create_account_direct(mail_client):
     """
     直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
@@ -2543,12 +2571,8 @@ def create_account_direct(mail_client):
             return None
         except Exception as exc:
             logger.warning("[direct-register] discard attempt for %s: %s", email, exc)
-            if not added_to_pool:
-                try:
-                    mail_client.delete_account(account_id)
-                except Exception as delete_exc:
-                    logger.warning("[direct-register] delete temp mailbox failed: %s", delete_exc)
-            if registered and attempt == 2:
+            _discard_direct_register_attempt(email, account_id, mail_client, added_to_pool=added_to_pool)
+            if attempt == 2:
                 logger.error("[direct-register] register failed after 3 attempts: %s", email)
         finally:
             flow.close()

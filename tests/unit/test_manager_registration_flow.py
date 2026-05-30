@@ -24,6 +24,7 @@ def test_create_account_direct_discards_failed_mailbox_and_uses_next_email(monke
     updates = []
     auth_files = []
     resets = []
+    cleanup_calls = []
 
     class FakeFlow:
         def __init__(self, **kwargs):
@@ -51,7 +52,12 @@ def test_create_account_direct_discards_failed_mailbox_and_uses_next_email(monke
     monkeypatch.setattr(
         manager,
         "_is_email_in_team",
-        lambda email: email == "second@example.com",
+        lambda email: email in {"first@example.com", "second@example.com"},
+    )
+    monkeypatch.setattr(
+        manager,
+        "delete_managed_account",
+        lambda email, **kwargs: cleanup_calls.append((email, kwargs)) or {},
     )
     monkeypatch.setattr(manager, "add_account", lambda *args, **kwargs: updates.append(("add", args, kwargs)))
     monkeypatch.setattr(manager, "save_auth_file", lambda bundle: f"/tmp/{bundle['email']}.json")
@@ -78,6 +84,74 @@ def test_create_account_direct_discards_failed_mailbox_and_uses_next_email(monke
     assert auth_files == []
     assert resets == ["second@example.com"]
     assert len(created) == 2
+    assert cleanup_calls == [
+        (
+            "first@example.com",
+            {
+                "remove_remote": True,
+                "remove_cloudmail": False,
+                "sync_cpa_after": False,
+                "mail_client": None,
+            },
+        )
+    ]
+
+
+def test_create_account_direct_discards_oauth_crash_after_pool_add(monkeypatch):
+    cleanup_calls = []
+    updates = []
+    resets = []
+
+    class FakeFlow:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+        def run_register(self, email, password, name, birthdate):
+            return None
+
+        def oauth_team(self, email, password):
+            if email == "first@example.com":
+                raise RuntimeError("oauth crashed")
+            return {"ok": True, "bundle": {"email": email, "plan_type": "team"}}
+
+        def close(self):
+            return None
+
+    fake_module = types.ModuleType("autoteam.robust_flow")
+    fake_module.RobustFlow = FakeFlow
+    monkeypatch.setitem(sys.modules, "autoteam.robust_flow", fake_module)
+    monkeypatch.setattr(manager, "_is_email_in_team", lambda email: email in {"first@example.com", "second@example.com"})
+    monkeypatch.setattr(
+        manager,
+        "delete_managed_account",
+        lambda email, **kwargs: cleanup_calls.append((email, kwargs)) or {"cloudmail_deleted": True},
+    )
+    monkeypatch.setattr(manager, "add_account", lambda *args, **kwargs: updates.append(("add", args, kwargs)))
+    monkeypatch.setattr(manager, "save_auth_file", lambda bundle: f"/tmp/{bundle['email']}.json")
+    monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append(("update", email, kwargs)))
+    monkeypatch.setattr(manager, "_auth_repair_reset", lambda email: resets.append(email))
+    monkeypatch.setattr(manager.time, "time", lambda: 1234567890)
+
+    mail_client = _FakeMailClient(
+        [
+            ("mail-1", "first@example.com"),
+            ("mail-2", "second@example.com"),
+        ]
+    )
+
+    result = manager.create_account_direct(mail_client)
+
+    assert result == "second@example.com"
+    assert mail_client.deleted == []
+    assert resets == ["second@example.com"]
+    assert cleanup_calls[0][0] == "first@example.com"
+    assert cleanup_calls[0][1]["remove_remote"] is True
+    assert cleanup_calls[0][1]["remove_cloudmail"] is True
+    assert cleanup_calls[0][1]["sync_cpa_after"] is False
+    assert cleanup_calls[0][1]["mail_client"] is mail_client
 
 
 def test_record_auth_repair_failure_disables_account_on_account_deactivated(monkeypatch):
