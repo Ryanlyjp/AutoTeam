@@ -97,6 +97,12 @@ export const api = {
 
   getTasks: () => request('GET', '/tasks'),
   getTask: (id) => request('GET', `/tasks/${id}`),
+  cancelTask: (id) => request('POST', `/tasks/${id}/cancel`),
+
+  getRuntimeControl: () => request('GET', '/runtime-control'),
+  stopCurrentActivity: () => request('POST', '/runtime-control/stop-current'),
+  pauseAllActivity: () => request('POST', '/runtime-control/pause'),
+  resumeAllActivity: () => request('POST', '/runtime-control/resume'),
 
   getAutoCheckConfig: () => request('GET', '/config/auto-check'),
   setAutoCheckConfig: (cfg) => request('PUT', '/config/auto-check', cfg),

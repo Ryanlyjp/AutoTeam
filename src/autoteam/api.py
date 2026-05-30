@@ -209,6 +209,7 @@ _ALL_RUNTIME_ENV_KEYS = [
     "AUTO_CHECK_MIN_LOW",
     "AUTO_CHECK_RETRY_ADD_PHONE",
     "AUTO_CHECK_ADD_PHONE_MAX_RETRIES",
+    "AUTOTEAM_RUNTIME_PAUSED",
     "PLAYWRIGHT_PROXY_URL",
     "PLAYWRIGHT_PROXY_SERVER",
     "PLAYWRIGHT_PROXY_USERNAME",
@@ -599,6 +600,87 @@ def _parse_bool_text(value: object, *, default: bool | None = None) -> bool | No
     raise ValueError(f"无效布尔值: {value}")
 
 
+_RUNTIME_PAUSE_ENV_KEY = "AUTOTEAM_RUNTIME_PAUSED"
+_RUNTIME_PAUSE_DEFAULT_MESSAGE = "已暂停全部活动"
+_runtime_control_lock = threading.RLock()
+_runtime_active_event = threading.Event()
+_runtime_control = {
+    "paused": bool(_parse_bool_text(os.environ.get(_RUNTIME_PAUSE_ENV_KEY), default=False)),
+    "paused_at": None,
+    "resumed_at": None,
+    "message": _RUNTIME_PAUSE_DEFAULT_MESSAGE if _parse_bool_text(os.environ.get(_RUNTIME_PAUSE_ENV_KEY), default=False) else "",
+}
+if _runtime_control["paused"]:
+    _runtime_active_event.clear()
+else:
+    _runtime_active_event.set()
+
+
+def _is_runtime_paused() -> bool:
+    with _runtime_control_lock:
+        return bool(_runtime_control.get("paused"))
+
+
+def _runtime_paused_detail(action_label: str | None = None) -> str:
+    action = str(action_label or "").strip()
+    if action:
+        return f"当前已暂停全部活动，请先恢复后再{action}"
+    return "当前已暂停全部活动，请先恢复"
+
+
+def _set_runtime_paused(
+    paused: bool,
+    *,
+    message: str | None = None,
+    persist: bool = False,
+    wake_auto_check: bool = True,
+) -> dict[str, object]:
+    now = time.time()
+    normalized_message = str(message or "").strip()
+
+    with _runtime_control_lock:
+        previous = bool(_runtime_control.get("paused"))
+        if paused:
+            if not previous:
+                _runtime_control["paused_at"] = now
+            _runtime_control["paused"] = True
+            _runtime_control["message"] = normalized_message or _runtime_control.get("message") or _RUNTIME_PAUSE_DEFAULT_MESSAGE
+            _runtime_active_event.clear()
+        else:
+            if previous:
+                _runtime_control["resumed_at"] = now
+            _runtime_control["paused"] = False
+            _runtime_control["paused_at"] = None
+            _runtime_control["message"] = normalized_message if normalized_message else ""
+            _runtime_active_event.set()
+
+    if persist:
+        from autoteam.setup_wizard import _write_env
+
+        value = "true" if paused else "false"
+        os.environ[_RUNTIME_PAUSE_ENV_KEY] = value
+        _write_env(_RUNTIME_PAUSE_ENV_KEY, value)
+        _sync_runtime_env_reload_state()
+
+    if wake_auto_check:
+        restart_event = globals().get("_auto_check_restart")
+        if restart_event is not None:
+            restart_event.set()
+
+    return dict(_runtime_control)
+
+
+def _sync_runtime_pause_from_env() -> None:
+    paused = bool(_parse_bool_text(os.environ.get(_RUNTIME_PAUSE_ENV_KEY), default=False))
+    default_message = _RUNTIME_PAUSE_DEFAULT_MESSAGE if paused else ""
+    _set_runtime_paused(paused, message=default_message, persist=False, wake_auto_check=False)
+
+
+def _ensure_runtime_active(action_label: str | None = None):
+    if _is_runtime_paused():
+        raise HTTPException(status_code=409, detail=_runtime_paused_detail(action_label))
+
+
 def _validate_runtime_optional_values(values: dict[str, str]):
     normalized = dict(values)
 
@@ -711,6 +793,7 @@ def _sync_runtime_globals():
     global API_KEY
 
     API_KEY = os.environ.get("API_KEY", "")
+    _sync_runtime_pause_from_env()
 
     auto_check_config = globals().get("_auto_check_config")
     auto_check_restart = globals().get("_auto_check_restart")
@@ -1118,6 +1201,71 @@ def _get_task_cancel_message(task: dict | None) -> str:
     return task.get("cancel_message") or "任务已终止"
 
 
+def _current_background_task() -> dict | None:
+    if _current_task_id:
+        task = _tasks.get(_current_task_id)
+        if task:
+            return task
+
+    active = [task for task in _tasks.values() if task.get("status") in ("pending", "running", "cancelling")]
+    if not active:
+        return None
+    return max(active, key=lambda item: item.get("created_at") or 0)
+
+
+def _current_activity() -> dict | None:
+    if _admin_login_api:
+        return {
+            "kind": "admin-login",
+            "task_id": "admin-login",
+            "command": "admin-login",
+            "status": "running",
+            "step": _admin_login_step,
+            "started_at": None,
+        }
+
+    if _main_codex_flow:
+        return {
+            "kind": "main-codex",
+            "task_id": "main-codex-sync",
+            "command": "main-codex-sync",
+            "status": "running",
+            "step": _main_codex_step,
+            "action": _main_codex_action,
+            "started_at": None,
+        }
+
+    manual_status = _manual_account_status()
+    if manual_status.get("in_progress"):
+        return {
+            "kind": "manual-account",
+            "task_id": "manual-account",
+            "command": "manual-account",
+            "status": str(manual_status.get("status") or "running"),
+            "step": manual_status.get("state") or "",
+            "started_at": manual_status.get("started_at"),
+        }
+
+    task = _current_background_task()
+    if task:
+        return {
+            "kind": "task",
+            "task_id": task.get("task_id"),
+            "command": task.get("command", "unknown"),
+            "status": task.get("status", "pending"),
+            "started_at": task.get("started_at"),
+            "created_at": task.get("created_at"),
+        }
+    return None
+
+
+def _runtime_control_status() -> dict[str, object]:
+    with _runtime_control_lock:
+        payload = dict(_runtime_control)
+    payload["current_activity"] = _current_activity()
+    return payload
+
+
 def is_task_cancel_requested(task_id: str | None = None) -> bool:
     task = _tasks.get(task_id or _current_task_id or "")
     return bool(task and task.get("cancel_requested"))
@@ -1233,34 +1381,117 @@ def _run_with_chatgpt_session(callback):
 
 
 def _current_busy_detail(default_message: str):
-    if _admin_login_api:
-        return {
-            "message": default_message,
-            "running_task": {
-                "task_id": "admin-login",
-                "command": "admin-login",
-                "started_at": None,
-            },
-        }
-
-    if _main_codex_flow:
-        return {
-            "message": default_message,
-            "running_task": {
-                "task_id": "main-codex-sync",
-                "command": "main-codex-sync",
-                "started_at": None,
-            },
-        }
-
-    running = _tasks.get(_current_task_id, {})
+    running = _current_activity() or {}
     return {
         "message": default_message,
         "running_task": {
-            "task_id": _current_task_id,
+            "task_id": running.get("task_id"),
             "command": running.get("command", "unknown"),
             "started_at": running.get("started_at"),
+            "status": running.get("status"),
+            "step": running.get("step"),
         },
+    }
+
+
+def _request_task_cancel(task_id: str, *, message: str | None = None) -> dict[str, object]:
+    task = _tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if message:
+        task["cancel_message"] = str(message)
+
+    if task["status"] in _TASK_TERMINAL_STATUSES:
+        return {
+            "task_id": task_id,
+            "status": task["status"],
+            "message": "任务已结束，无需终止",
+            "task": task,
+        }
+
+    if not task.get("cancel_requested"):
+        task["cancel_requested"] = True
+        task["cancel_requested_at"] = time.time()
+        if task["status"] in ("pending", "running"):
+            task["status"] = "cancelling"
+        task["error"] = "任务终止中"
+        logger.warning("[API] 已请求终止任务 %s (%s)", task_id[:8], task.get("command", "unknown"))
+
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "message": "已发送终止请求，任务会在安全检查点停止",
+        "task": task,
+    }
+
+
+def _cancel_admin_login_flow():
+    global _admin_login_api, _admin_login_step
+    if _admin_login_api:
+        try:
+            _pw_executor.run(_admin_login_api.stop)
+        except Exception:
+            pass
+        _admin_login_api = None
+        _admin_login_step = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+    return {"message": "管理员登录已取消", "admin": _admin_status()}
+
+
+def _cancel_main_codex_flow():
+    global _main_codex_flow, _main_codex_step, _main_codex_action
+    if _main_codex_flow:
+        try:
+            _pw_executor.run(_main_codex_flow.stop)
+        except Exception:
+            pass
+        _main_codex_flow = None
+        _main_codex_step = None
+        _main_codex_action = None
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+    return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
+
+
+def _cancel_manual_account_flow():
+    global _manual_account_flow
+    if _manual_account_flow:
+        try:
+            _manual_account_flow.stop()
+        except Exception:
+            pass
+        _manual_account_flow = None
+    return {"message": "手动添加账号流程已取消", "manual_account": _manual_account_status()}
+
+
+def _force_stop_current_activity(message: str = "当前活动已强制停止") -> dict[str, object]:
+    activity = _current_activity()
+    if not activity:
+        return {
+            "message": "当前没有活动中的任务或流程",
+            "stopped": None,
+            "runtime": _runtime_control_status(),
+        }
+
+    kind = activity.get("kind")
+    if kind == "task":
+        result = _request_task_cancel(str(activity.get("task_id") or ""), message=message)
+    elif kind == "admin-login":
+        result = _cancel_admin_login_flow()
+    elif kind == "main-codex":
+        result = _cancel_main_codex_flow()
+    elif kind == "manual-account":
+        result = _cancel_manual_account_flow()
+    else:
+        result = {"message": message}
+
+    return {
+        "message": message,
+        "stopped": activity,
+        "result": result,
+        "runtime": _runtime_control_status(),
     }
 
 
@@ -1305,6 +1536,8 @@ def _run_task(task_id: str, func, *args, **kwargs):
 
 def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
     """创建并启动后台任务，返回任务信息"""
+    _ensure_runtime_active("启动新任务")
+
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再试"))
     _playwright_lock.release()
@@ -1601,6 +1834,7 @@ def get_manual_account_status():
 def post_admin_login_start(params: AdminEmailParams):
     """开始管理员登录流程。"""
     global _admin_login_api, _admin_login_step
+    _ensure_runtime_active("开始管理员登录")
 
     if _admin_login_api:
         try:
@@ -1651,6 +1885,7 @@ def post_admin_login_start(params: AdminEmailParams):
 def post_admin_login_session(params: AdminSessionParams):
     """手动导入管理员 session_token。"""
     global _admin_login_api, _admin_login_step
+    _ensure_runtime_active("导入管理员 session_token")
 
     if _admin_login_api:
         post_admin_login_cancel()
@@ -1691,6 +1926,7 @@ def post_admin_login_session(params: AdminSessionParams):
 def post_admin_login_password(params: AdminPasswordParams):
     """提交管理员密码。"""
     global _admin_login_api, _admin_login_step
+    _ensure_runtime_active("继续管理员登录")
     if not _admin_login_api or _admin_login_step != "password_required":
         raise HTTPException(status_code=409, detail="当前没有等待密码的管理员登录流程")
 
@@ -1724,6 +1960,7 @@ def post_admin_login_password(params: AdminPasswordParams):
 def post_admin_login_code(params: AdminCodeParams):
     """提交管理员验证码。"""
     global _admin_login_api, _admin_login_step
+    _ensure_runtime_active("继续管理员登录")
     if not _admin_login_api or _admin_login_step != "code_required":
         raise HTTPException(status_code=409, detail="当前没有等待验证码的管理员登录流程")
 
@@ -1757,6 +1994,7 @@ def post_admin_login_code(params: AdminCodeParams):
 def post_admin_login_workspace(params: AdminWorkspaceParams):
     """提交管理员 workspace 选择。"""
     global _admin_login_api, _admin_login_step
+    _ensure_runtime_active("继续管理员登录")
     if not _admin_login_api or _admin_login_step != "workspace_required":
         raise HTTPException(status_code=409, detail="当前没有等待组织选择的管理员登录流程")
 
@@ -1789,17 +2027,7 @@ def post_admin_login_workspace(params: AdminWorkspaceParams):
 @app.post("/api/admin/login/cancel")
 def post_admin_login_cancel():
     """取消管理员登录流程。"""
-    global _admin_login_api, _admin_login_step
-    if _admin_login_api:
-        try:
-            _pw_executor.run(_admin_login_api.stop)
-        except Exception:
-            pass
-        _admin_login_api = None
-        _admin_login_step = None
-        if _playwright_lock.locked():
-            _playwright_lock.release()
-    return {"message": "管理员登录已取消", "admin": _admin_status()}
+    return _cancel_admin_login_flow()
 
 
 @app.post("/api/admin/logout")
@@ -1817,6 +2045,7 @@ def post_admin_logout():
 def post_main_codex_start():
     """开始主号 Codex 登录并同步到已启用远端。"""
     global _main_codex_flow, _main_codex_step, _main_codex_action
+    _ensure_runtime_active("开始主号 Codex 登录")
 
     if _main_codex_flow:
         try:
@@ -1864,6 +2093,7 @@ def post_main_codex_start():
 def post_main_codex_login():
     """开始主号 Codex 登录，仅保存本地认证文件。"""
     global _main_codex_flow, _main_codex_step, _main_codex_action
+    _ensure_runtime_active("开始主号 Codex 登录")
 
     if _main_codex_flow:
         try:
@@ -1896,6 +2126,7 @@ def post_main_codex_login():
 def post_main_codex_password(params: AdminPasswordParams):
     """提交主号 Codex 登录密码。"""
     global _main_codex_flow, _main_codex_step, _main_codex_action
+    _ensure_runtime_active("继续主号 Codex 登录")
     if not _main_codex_flow or _main_codex_step != "password_required":
         raise HTTPException(status_code=409, detail="当前没有等待密码的主号 Codex 登录流程")
 
@@ -1927,6 +2158,7 @@ def post_main_codex_password(params: AdminPasswordParams):
 def post_main_codex_code(params: AdminCodeParams):
     """提交主号 Codex 登录验证码。"""
     global _main_codex_flow, _main_codex_step, _main_codex_action
+    _ensure_runtime_active("继续主号 Codex 登录")
     if not _main_codex_flow or _main_codex_step != "code_required":
         raise HTTPException(status_code=409, detail="当前没有等待验证码的主号 Codex 登录流程")
 
@@ -1957,18 +2189,7 @@ def post_main_codex_code(params: AdminCodeParams):
 @app.post("/api/main-codex/cancel")
 def post_main_codex_cancel():
     """取消主号 Codex 登录流程。"""
-    global _main_codex_flow, _main_codex_step, _main_codex_action
-    if _main_codex_flow:
-        try:
-            _pw_executor.run(_main_codex_flow.stop)
-        except Exception:
-            pass
-        _main_codex_flow = None
-        _main_codex_step = None
-        _main_codex_action = None
-        if _playwright_lock.locked():
-            _playwright_lock.release()
-    return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
+    return _cancel_main_codex_flow()
 
 
 def _delete_main_codex_from_enabled_targets():
@@ -2014,12 +2235,14 @@ def _delete_main_codex_from_enabled_targets():
 @app.post("/api/main-codex/delete-remote-files")
 def post_main_codex_delete_remote_files():
     """删除已启用远端中已上传的主号 Codex 认证文件。"""
+    _ensure_runtime_active("删除主号 Codex 远端文件")
     return _delete_main_codex_from_enabled_targets()
 
 
 @app.post("/api/main-codex/delete-cpa")
 def post_main_codex_delete_cpa():
     """兼容旧接口：删除已启用远端中的主号 Codex 认证文件。"""
+    _ensure_runtime_active("删除主号 Codex 远端文件")
     return _delete_main_codex_from_enabled_targets()
 
 
@@ -2027,6 +2250,7 @@ def post_main_codex_delete_cpa():
 def post_manual_account_start():
     """开始手动添加账号流程，返回 OAuth 链接。"""
     global _manual_account_flow
+    _ensure_runtime_active("开始手动 OAuth 流程")
 
     if _manual_account_flow:
         try:
@@ -2057,6 +2281,7 @@ def post_manual_account_start():
 def post_manual_account_callback(params: ManualAccountCallbackParams):
     """提交 OAuth 回调 URL，完成手动添加账号。"""
     global _manual_account_flow
+    _ensure_runtime_active("继续手动 OAuth 流程")
     if not _manual_account_flow:
         raise HTTPException(status_code=409, detail="当前没有等待回调的手动添加账号流程")
 
@@ -2070,14 +2295,7 @@ def post_manual_account_callback(params: ManualAccountCallbackParams):
 @app.post("/api/manual-account/cancel")
 def post_manual_account_cancel():
     """取消手动添加账号流程。"""
-    global _manual_account_flow
-    if _manual_account_flow:
-        try:
-            _manual_account_flow.stop()
-        except Exception:
-            pass
-        _manual_account_flow = None
-    return {"message": "手动添加账号流程已取消", "manual_account": _manual_account_status()}
+    return _cancel_manual_account_flow()
 
 
 @app.get("/api/accounts")
@@ -2152,6 +2370,7 @@ def get_standby():
 @app.delete("/api/accounts/{email}")
 def delete_account(email: str):
     """删除本地管理账号及其关联资源。"""
+    _ensure_runtime_active("删除账号")
     if not _playwright_lock.acquire(blocking=False):
         running = _tasks.get(_current_task_id, {})
         raise HTTPException(
@@ -2312,6 +2531,7 @@ def post_enable_account(email: str):
 @app.post("/api/accounts/{email}/kick")
 def post_kick_account(email: str):
     """将账号从 Team 中移出，状态变为 standby"""
+    _ensure_runtime_active("移出 Team 账号")
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再操作"))
 
@@ -2426,30 +2646,32 @@ def get_status():
 
     accounts = load_accounts()
     quota_cache = {}
+    runtime_paused = _is_runtime_paused()
 
-    for acc in accounts:
-        if not _is_main_account_email(acc.get("email")) and is_account_disabled(acc):
-            continue
-        if acc["status"] not in (STATUS_ACTIVE, STATUS_AUTH_PENDING) and not _is_main_account_email(acc.get("email")):
-            continue
+    if not runtime_paused:
+        for acc in accounts:
+            if not _is_main_account_email(acc.get("email")) and is_account_disabled(acc):
+                continue
+            if acc["status"] not in (STATUS_ACTIVE, STATUS_AUTH_PENDING) and not _is_main_account_email(acc.get("email")):
+                continue
 
-        auth_file = _resolve_status_auth_file(acc)
-        if not auth_file:
-            continue
+            auth_file = _resolve_status_auth_file(acc)
+            if not auth_file:
+                continue
 
-        try:
-            auth_data = json.loads(read_text(Path(auth_file)))
-            access_token = auth_data.get("access_token")
-            if access_token:
-                status, info = check_codex_quota(access_token)
-                if status == "ok" and isinstance(info, dict):
-                    quota_cache[acc["email"]] = info
-                elif status == "exhausted":
-                    quota_info = quota_result_quota_info(info)
-                    if quota_info:
-                        quota_cache[acc["email"]] = quota_info
-        except Exception:
-            pass
+            try:
+                auth_data = json.loads(read_text(Path(auth_file)))
+                access_token = auth_data.get("access_token")
+                if access_token:
+                    status, info = check_codex_quota(access_token)
+                    if status == "ok" and isinstance(info, dict):
+                        quota_cache[acc["email"]] = info
+                    elif status == "exhausted":
+                        quota_info = quota_result_quota_info(info)
+                        if quota_info:
+                            quota_cache[acc["email"]] = quota_info
+            except Exception:
+                pass
 
     sanitized_accounts = [_sanitize_account(a, quota_cache.get(a.get("email"))) for a in accounts]
 
@@ -2473,6 +2695,7 @@ def get_status():
 @app.post("/api/sync")
 def post_sync():
     """同步认证文件到已启用远端。"""
+    _ensure_runtime_active("同步远端")
     from autoteam.sync_targets import describe_sync_targets, get_enabled_sync_targets, sync_to_configured_targets
 
     _require_sync_target_configs("同步远端")
@@ -2484,6 +2707,7 @@ def post_sync():
 @app.post("/api/sync/from-cpa")
 def post_sync_from_cpa():
     """从 CPA 反向同步认证文件到本地。"""
+    _ensure_runtime_active("拉取 CPA")
     _require_cpa_configs("拉取 CPA")
 
     from autoteam.cpa_sync import sync_from_cpa
@@ -2495,6 +2719,7 @@ def post_sync_from_cpa():
 @app.post("/api/sync/accounts")
 def post_sync_accounts():
     """从 auths 目录和 Team 成员同步账号到 accounts.json"""
+    _ensure_runtime_active("同步账号状态")
     from autoteam.manager import sync_account_states
 
     if not _playwright_lock.acquire(blocking=False):
@@ -2514,6 +2739,7 @@ def post_sync_accounts():
 @app.get("/api/team/members")
 def get_team_members():
     """获取 Team 全部成员（包括手动添加的外部成员）"""
+    _ensure_runtime_active("查询 Team 成员")
     from autoteam.admin_state import get_admin_session_token, get_chatgpt_account_id
 
     if not get_admin_session_token() or not get_chatgpt_account_id():
@@ -2573,6 +2799,7 @@ def get_team_members():
 @app.post("/api/team/members/remove")
 def post_team_member_remove(params: TeamMemberRemoveParams):
     """移出 Team 成员或取消邀请。"""
+    _ensure_runtime_active("移除 Team 成员")
     from autoteam.admin_state import get_admin_session_token, get_chatgpt_account_id
 
     if not get_admin_session_token() or not get_chatgpt_account_id():
@@ -2781,31 +3008,42 @@ def get_task(task_id: str):
 @app.post("/api/tasks/{task_id}/cancel")
 def cancel_task(task_id: str):
     """请求终止后台任务。"""
-    task = _tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
+    return _request_task_cancel(task_id)
 
-    if task["status"] in _TASK_TERMINAL_STATUSES:
-        return {
-            "task_id": task_id,
-            "status": task["status"],
-            "message": "任务已结束，无需终止",
-            "task": task,
-        }
 
-    if not task.get("cancel_requested"):
-        task["cancel_requested"] = True
-        task["cancel_requested_at"] = time.time()
-        if task["status"] in ("pending", "running"):
-            task["status"] = "cancelling"
-        task["error"] = "任务终止中"
-        logger.warning("[API] 已请求终止任务 %s (%s)", task_id[:8], task.get("command", "unknown"))
+@app.get("/api/runtime-control")
+def get_runtime_control():
+    """查看当前活动与全局暂停状态。"""
+    return _runtime_control_status()
 
+
+@app.post("/api/runtime-control/stop-current")
+def post_runtime_stop_current():
+    """强行停止当前正在执行的任务或交互流程。"""
+    return _force_stop_current_activity("当前活动已强制停止")
+
+
+@app.post("/api/runtime-control/pause")
+def post_runtime_pause():
+    """暂停全部活动，并终止当前活跃流程。"""
+    already_paused = _is_runtime_paused()
+    _set_runtime_paused(True, message=_RUNTIME_PAUSE_DEFAULT_MESSAGE, persist=True)
+    stopped = _force_stop_current_activity("系统已暂停，当前活动已强制停止")
     return {
-        "task_id": task_id,
-        "status": task["status"],
-        "message": "已发送终止请求，任务会在安全检查点停止",
-        "task": task,
+        "message": "全部活动已暂停" if not already_paused else "全部活动已保持暂停",
+        "stopped": stopped.get("stopped"),
+        "runtime": _runtime_control_status(),
+    }
+
+
+@app.post("/api/runtime-control/resume")
+def post_runtime_resume():
+    """恢复全部活动。"""
+    was_paused = _is_runtime_paused()
+    _set_runtime_paused(False, message="", persist=True)
+    return {
+        "message": "全部活动已恢复" if was_paused else "当前未处于暂停状态",
+        "runtime": _runtime_control_status(),
     }
 
 
@@ -2957,6 +3195,11 @@ def _auto_check_wait(interval_seconds, poll_seconds=0.2):
             _auto_check_restart.clear()
             return "restart"
 
+        if _is_runtime_paused():
+            if _auto_check_stop.wait(poll):
+                return "stop"
+            continue
+
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             if _auto_check_stop.wait(0):
@@ -3061,6 +3304,13 @@ def _auto_check_loop():
         }
 
     while not _auto_check_stop.is_set():
+        if _is_runtime_paused():
+            logger.info("[巡检] 全局活动已暂停，自动巡检等待恢复...")
+            while _is_runtime_paused() and not _auto_check_stop.is_set():
+                if _auto_check_wait(1) == "stop":
+                    return
+            continue
+
         try:
             _maybe_reload_runtime_config_from_env_file()
         except Exception as exc:
@@ -3477,6 +3727,7 @@ class _QuietAccessLog(logging.Filter):
         "/api/admin/status",
         "/api/main-codex/status",
         "/api/manual-account/status",
+        "/api/runtime-control",
         "/api/auth/check",
         "/api/setup/status",
     )

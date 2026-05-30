@@ -111,8 +111,8 @@ def _abort_if_cancel_requested():
     ensure_current_task_not_cancelled()
 
 
-AUTH_REPAIR_HARD_FAILURE_TYPES = {"human_verification"}
-AUTH_REPAIR_SINGLE_ATTEMPT_FAILURE_TYPES = {"add_phone", "human_verification"}
+AUTH_REPAIR_HARD_FAILURE_TYPES = {"human_verification", "account_deactivated"}
+AUTH_REPAIR_SINGLE_ATTEMPT_FAILURE_TYPES = {"add_phone", "human_verification", "account_deactivated"}
 
 
 def _normalized_email(value: str | None) -> str:
@@ -312,6 +312,7 @@ def _auth_repair_add_phone_retry_delays(max_retries: int | None = None) -> tuple
 def _auth_repair_error_label(error_type: str | None) -> str:
     mapping = {
         "add_phone": "手机号验证",
+        "account_deactivated": "账号已被停用或删除",
         "choose_account_selection": "账号选择未完成",
         "human_verification": "人机验证",
         "email_verification": "邮箱验证码页卡住",

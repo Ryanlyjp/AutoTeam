@@ -37,7 +37,7 @@ CODEX_CALLBACK_PORT = 1455
 CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 AUTH_OPENAI_ORIGIN = "https://auth.openai.com"
 AUTO_PROVISION_PROPAGATION_DELAY = 5
-_EARLY_OAUTH_BLOCK_FAILURE_TYPES = {"add_phone", "human_verification", "site_unavailable"}
+_EARLY_OAUTH_BLOCK_FAILURE_TYPES = {"add_phone", "human_verification", "site_unavailable", "account_deactivated"}
 
 
 def _generate_pkce():
@@ -85,6 +85,13 @@ def _classify_oauth_failure(url, body_excerpt=""):
         return "choose_account_selection", "卡在账号选择页", True
     if "verify you are human" in body or "captcha" in body:
         return "human_verification", "命中人机验证", False
+    if (
+        "account_deactivated" in body
+        or "account deactivated" in body
+        or "deleted or deactivated" in body
+        or "you do not have an account because it has been deleted or deactivated" in body
+    ):
+        return "account_deactivated", "账号已被停用或删除", False
     if "unable to load site" in body or "try again later" in body or "status page" in body:
         return "site_unavailable", "站点暂时不可用或代理异常", True
     if "email-verification" in url:

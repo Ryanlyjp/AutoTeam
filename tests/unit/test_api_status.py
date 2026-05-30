@@ -254,6 +254,31 @@ def test_get_status_counts_disabled_and_skips_disabled_quota_checks(tmp_path, mo
     }
 
 
+def test_get_status_skips_live_quota_checks_when_runtime_is_paused(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "_runtime_control",
+        {"paused": True, "paused_at": time.time(), "resumed_at": None, "message": "已暂停全部活动"},
+    )
+    monkeypatch.setattr(api, "_runtime_control_lock", threading.RLock())
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {"email": "active@example.com", "status": "active", "auth_file": "/tmp/active-auth.json", "disabled": False}
+        ],
+    )
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(
+        "autoteam.codex_auth.check_codex_quota",
+        lambda access_token: (_ for _ in ()).throw(AssertionError("quota check should not run while paused")),
+    )
+
+    result = api.get_status()
+
+    assert result["quota_cache"] == {}
+    assert result["accounts"][0]["status"] == "active"
+
+
 def test_post_setup_save_only_requires_api_key_and_generates_one(monkeypatch):
     written = {}
 
@@ -1112,6 +1137,62 @@ def test_cancel_task_marks_running_task_as_cancelling(monkeypatch):
     assert task["cancel_requested"] is True
     assert task["cancel_requested_at"] is not None
     assert task["error"] == "任务终止中"
+
+
+def test_start_task_rejects_when_runtime_is_paused(monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "_runtime_control",
+        {"paused": True, "paused_at": time.time(), "resumed_at": None, "message": "已暂停全部活动"},
+    )
+    monkeypatch.setattr(api, "_runtime_control_lock", threading.RLock())
+
+    with pytest.raises(HTTPException) as exc_info:
+        api._start_task("rotate", lambda: None, {})
+
+    assert exc_info.value.status_code == 409
+    assert "已暂停全部活动" in str(exc_info.value.detail)
+
+
+def test_runtime_pause_persists_state_and_stops_current_task(monkeypatch):
+    task = {
+        "task_id": "task-1",
+        "command": "rotate",
+        "params": {},
+        "status": "running",
+        "created_at": time.time(),
+        "started_at": time.time(),
+        "finished_at": None,
+        "result": None,
+        "error": None,
+        "cancel_requested": False,
+        "cancel_requested_at": None,
+        "cancel_message": "任务已终止",
+    }
+    writes = []
+
+    monkeypatch.setattr(api, "_tasks", {"task-1": task})
+    monkeypatch.setattr(api, "_current_task_id", "task-1")
+    monkeypatch.setattr(
+        api,
+        "_runtime_control",
+        {"paused": False, "paused_at": None, "resumed_at": None, "message": ""},
+    )
+    monkeypatch.setattr(api, "_runtime_control_lock", threading.RLock())
+    active_event = threading.Event()
+    active_event.set()
+    monkeypatch.setattr(api, "_runtime_active_event", active_event)
+    monkeypatch.setattr(api, "_sync_runtime_env_reload_state", lambda: None)
+    monkeypatch.setattr(api, "_auto_check_restart", threading.Event())
+    monkeypatch.setattr("autoteam.setup_wizard._write_env", lambda key, value: writes.append((key, value)))
+
+    result = api.post_runtime_pause()
+
+    assert result["runtime"]["paused"] is True
+    assert result["stopped"]["task_id"] == "task-1"
+    assert task["cancel_requested"] is True
+    assert task["status"] == "cancelling"
+    assert writes == [("AUTOTEAM_RUNTIME_PAUSED", "true")]
 
 
 def test_run_task_marks_cancel_requested_task_as_cancelled(monkeypatch):

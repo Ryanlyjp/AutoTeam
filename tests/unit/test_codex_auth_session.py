@@ -235,6 +235,18 @@ def test_classify_oauth_failure_detects_choose_account_page():
     assert retryable is True
 
 
+def test_classify_oauth_failure_detects_account_deactivated_body():
+    error_type, detail, retryable = codex_auth._classify_oauth_failure(
+        "https://auth.openai.com/email-verification",
+        "Authentication Error error_code: account_deactivated "
+        "You do not have an account because it has been deleted or deactivated.",
+    )
+
+    assert error_type == "account_deactivated"
+    assert detail == "账号已被停用或删除"
+    assert retryable is False
+
+
 def test_extract_auth_code_reads_callback_url():
     code = codex_auth._extract_auth_code("http://localhost:1455/auth/callback?code=abc123&state=xyz")
 

@@ -19,6 +19,7 @@
             <th class="px-4 py-3 font-medium">创建时间</th>
             <th class="px-4 py-3 font-medium">耗时</th>
             <th class="px-4 py-3 font-medium">结果</th>
+            <th class="px-4 py-3 font-medium text-right">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -43,6 +44,16 @@
             <td class="px-4 py-3 text-xs max-w-xs truncate" :class="task.error ? 'text-red-400' : 'text-gray-400'">
               {{ task.error || formatResult(task.result) }}
             </td>
+            <td class="px-4 py-3 text-right">
+              <button
+                v-if="['pending', 'running', 'cancelling'].includes(task.status)"
+                @click="$emit('cancel-task', task)"
+                class="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-300 transition hover:bg-amber-500/20"
+              >
+                {{ task.status === 'cancelling' ? '终止中' : '终止' }}
+              </button>
+              <span v-else class="text-xs text-gray-600">-</span>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -54,12 +65,15 @@
 defineProps({
   tasks: { type: Array, default: () => [] },
 })
+defineEmits(['cancel-task'])
 
 function taskStatusClass(s) {
   return {
     pending: 'text-gray-400',
     running: 'text-yellow-400',
+    cancelling: 'text-amber-300',
     completed: 'text-green-400',
+    cancelled: 'text-orange-300',
     failed: 'text-red-400',
   }[s] || 'text-gray-400'
 }
@@ -67,13 +81,22 @@ function taskStatusClass(s) {
 function taskDotClass(s) {
   return {
     pending: 'bg-gray-400',
+    cancelling: 'bg-amber-300',
     completed: 'bg-green-400',
+    cancelled: 'bg-orange-300',
     failed: 'bg-red-400',
   }[s] || 'bg-gray-400'
 }
 
 function taskStatusLabel(s) {
-  return { pending: '等待中', running: '执行中', completed: '已完成', failed: '失败' }[s] || s
+  return {
+    pending: '等待中',
+    running: '执行中',
+    cancelling: '终止中',
+    completed: '已完成',
+    cancelled: '已终止',
+    failed: '失败',
+  }[s] || s
 }
 
 function formatTime(ts) {
@@ -84,7 +107,7 @@ function formatTime(ts) {
 
 function duration(task) {
   const start = task.started_at || task.created_at
-  const end = task.finished_at || (task.status === 'running' ? Date.now() / 1000 : null)
+  const end = task.finished_at || (['running', 'cancelling', 'pending'].includes(task.status) ? Date.now() / 1000 : null)
   if (!start || !end) return '-'
   const sec = Math.round(end - start)
   if (sec < 60) return `${sec}s`

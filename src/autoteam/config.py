@@ -236,6 +236,26 @@ def _build_easyproxy_browser_proxy():
     return proxy
 
 
+def _build_easyproxy_direct_proxy():
+    if not EASYPROXY_ENABLED:
+        return None
+    if EASYPROXY_MASTER_MODE != "direct":
+        return None
+
+    from autoteam import easyproxy
+
+    assignment = easyproxy.select_proxy_assignment(env=os.environ)
+    proxy = _parse_proxy_url(str(assignment.get("proxy_url") or ""))
+    if PLAYWRIGHT_PROXY_BYPASS and "bypass" not in proxy:
+        proxy["bypass"] = PLAYWRIGHT_PROXY_BYPASS
+    logger.info(
+        "[EasyProxy] 浏览器走 multi-port %s (%s)",
+        proxy.get("server") or assignment.get("proxy_url") or "",
+        assignment.get("name") or assignment.get("tag") or "-",
+    )
+    return proxy
+
+
 def mark_last_easyproxy_assignment_bad(reason: str) -> None:
     if not EASYPROXY_ENABLED:
         return
@@ -269,7 +289,7 @@ def get_playwright_launch_options():
 
     proxy = None
     if EASYPROXY_ENABLED:
-        proxy = _build_easyproxy_browser_proxy()
+        proxy = _build_easyproxy_browser_proxy() or _build_easyproxy_direct_proxy()
     else:
         proxy_url = _get_manual_proxy_url()
         if proxy_url:

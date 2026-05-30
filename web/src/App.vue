@@ -105,6 +105,16 @@
           <ThemeToggle />
         </div>
 
+        <div
+          v-if="runtimeControl?.paused"
+          class="mb-5 flex items-center gap-3 rounded-2xl border border-rose-400/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-200 backdrop-blur"
+        >
+          <span class="inline-block h-2.5 w-2.5 rounded-full bg-rose-300 shadow-[0_0_14px_rgba(253,164,175,0.9)]"></span>
+          <span class="font-medium">
+            {{ runtimeControl.message || '已暂停全部活动' }}
+          </span>
+        </div>
+
       <!-- 任务执行中提示 -->
         <div
           v-if="busyTask"
@@ -116,7 +126,9 @@
               ? '管理员登录中...'
               : busyTask.command === 'main-codex-sync'
                 ? '主号 Codex 同步中...'
-                : `${busyTask.command} 执行中...` }}
+                : busyTask.status === 'cancelling'
+                  ? `${busyTask.command} 终止中...`
+                  : `${busyTask.command} 执行中...` }}
           </span>
         </div>
 
@@ -147,7 +159,10 @@
           :manual-account-status="manualAccountStatus" @refresh="refresh" @progress="onAdminProgress" />
 
         <TaskHistoryPage v-else-if="currentPage === 'tasks'"
-          :tasks="tasks" />
+          :tasks="tasks"
+          :runtime-control="runtimeControl"
+          @refresh="refresh"
+        />
 
         <LogViewer v-else-if="currentPage === 'logs'" />
       </div>
@@ -184,15 +199,12 @@ const adminStatus = ref(null)
 const codexStatus = ref(null)
 const manualAccountStatus = ref(null)
 const tasks = ref([])
+const runtimeControl = ref(null)
 const loading = ref(false)
 const runningTask = ref(null)
 const busyTask = computed(() => {
-  if (adminStatus.value?.login_in_progress) {
-    return { command: 'admin-login' }
-  }
-  if (codexStatus.value?.in_progress) {
-    return { command: 'main-codex-sync' }
-  }
+  const current = runtimeControl.value?.current_activity
+  if (current) return current
   return runningTask.value
 })
 
@@ -247,19 +259,26 @@ function doLogout() {
 async function refresh() {
   loading.value = true
   try {
-    const [s, t, admin, codex, manualAccount] = await Promise.all([
+    const [s, t, admin, codex, manualAccount, control] = await Promise.all([
       api.getStatus(),
       api.getTasks(),
       api.getAdminStatus(),
       api.getMainCodexStatus(),
       api.getManualAccountStatus(),
+      api.getRuntimeControl(),
     ])
     status.value = s
     tasks.value = t
     adminStatus.value = admin
     codexStatus.value = codex
     manualAccountStatus.value = manualAccount
-    runningTask.value = t.find(t => t.status === 'running' || t.status === 'pending') || null
+    runtimeControl.value = control
+    runningTask.value = t.find(t => t.status === 'running' || t.status === 'pending' || t.status === 'cancelling') || null
+    if (control?.paused) {
+      stopPolling()
+    } else if (!pollTimer) {
+      startPolling(busyTask.value ? 10000 : 600000)
+    }
   } catch (e) {
     if (e.status === 401) {
       authenticated.value = false
