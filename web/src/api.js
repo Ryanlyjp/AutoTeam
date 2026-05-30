@@ -58,6 +58,7 @@ export const api = {
   getStandbyAccounts: () => request('GET', '/accounts/standby'),
   bulkDisableAccounts: (emails) => request('POST', '/accounts/bulk/disable', { emails }),
   bulkEnableAccounts: (emails) => request('POST', '/accounts/bulk/enable', { emails }),
+  bulkDeleteAccounts: (emails) => request('POST', '/accounts/bulk/delete', { emails }),
   disableAccount: (email) => request('POST', `/accounts/${encodeURIComponent(email)}/disable`),
   enableAccount: (email) => request('POST', `/accounts/${encodeURIComponent(email)}/enable`),
   deleteAccount: (email) => request('DELETE', `/accounts/${encodeURIComponent(email)}`),

@@ -1656,13 +1656,24 @@ def login_codex_via_browser(
     email, password, mail_client=None, *, return_result=False, signup_profile: SignupProfile | None = None
 ):
     _ensure_auto_provision_enabled()
-    return _login_codex_via_browser_direct(
-        email,
-        password,
+    from autoteam.robust_flow import RobustFlow
+
+    flow = RobustFlow(
         mail_client=mail_client,
-        return_result=return_result,
+        workspace_name=get_chatgpt_workspace_name(),
+        account_id=get_chatgpt_account_id(),
+        tag="Codex",
         signup_profile=signup_profile,
     )
+    try:
+        flow.start()
+        result = flow.oauth_team(email, password)
+    finally:
+        flow.close()
+
+    if return_result:
+        return result
+    return (result or {}).get("bundle")
 
 
 def _legacy_login_codex_via_browser(
@@ -2240,6 +2251,8 @@ class SessionCodexAuthFlow:
         self.state = secrets.token_urlsafe(16)
         self.auth_url = _build_auth_url(code_challenge, self.state)
         self.auth_code = None
+        self._result = None
+        self._robust_flow = None
         self.chatgpt = None
         self.page = None
 
@@ -2469,21 +2482,29 @@ class SessionCodexAuthFlow:
         if not self.email:
             raise RuntimeError("缺少登录邮箱")
 
-        from autoteam.chatgpt_api import ChatGPTTeamAPI
+        _ensure_auto_provision_enabled()
 
-        self.chatgpt = ChatGPTTeamAPI()
-        self.chatgpt.start_with_session(
-            self.session_token,
-            self.account_id,
-            self.workspace_name,
-            require_browser=True,
+        from autoteam.robust_flow import RobustFlow
+
+        if self._robust_flow:
+            try:
+                self._robust_flow.close()
+            except Exception:
+                pass
+
+        self._robust_flow = RobustFlow(
+            workspace_name=self.workspace_name,
+            account_id=self.account_id,
+            tag="Codex",
         )
-        self.page = self.chatgpt.context.new_page()
-        self._attach_callback_listeners()
-        self._inject_auth_cookies()
-        self.page.goto(self.auth_url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(3)
-        return self._advance()
+        self._robust_flow.start()
+        self._result = self._robust_flow.oauth_team_via_session(self.email, self.session_token) or {}
+        if self._result.get("ok") and self._result.get("bundle"):
+            return {"step": "completed", "detail": None}
+        return {
+            "step": self._result.get("error_type") or "unknown",
+            "detail": self._result.get("error_detail") or "session OAuth failed",
+        }
 
     def submit_password(self, password):
         self.password = password
@@ -2511,10 +2532,11 @@ class SessionCodexAuthFlow:
         return self._advance()
 
     def complete(self):
-        if not self.auth_code:
-            raise RuntimeError("未获取到 Codex authorization code")
+        result = self._result or {}
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error_detail") or "未完成 Codex OAuth")
 
-        bundle = _exchange_auth_code(self.auth_code, self.code_verifier, fallback_email=self.email)
+        bundle = result.get("bundle")
         if not bundle:
             raise RuntimeError("Codex token 交换失败")
 
@@ -2527,6 +2549,12 @@ class SessionCodexAuthFlow:
         }
 
     def stop(self):
+        if self._robust_flow:
+            try:
+                self._robust_flow.close()
+            except Exception:
+                pass
+        self._robust_flow = None
         if self.chatgpt:
             self.chatgpt.stop()
         self.chatgpt = None

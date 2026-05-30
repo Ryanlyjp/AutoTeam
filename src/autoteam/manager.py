@@ -41,7 +41,7 @@ from autoteam.accounts import (
     save_accounts,
     update_account,
 )
-from autoteam.admin_state import get_admin_email, get_admin_state_summary, get_chatgpt_account_id
+from autoteam.admin_state import get_admin_email, get_admin_state_summary, get_chatgpt_account_id, get_chatgpt_workspace_name
 from autoteam.chatgpt_api import ChatGPTTeamAPI
 from autoteam.codex_auth import (
     MainCodexSyncFlow,
@@ -457,6 +457,8 @@ def _record_auth_repair_failure(
         }
 
     update_account(email, **state)
+    if error_type == "account_deactivated":
+        update_account(email, disabled=True)
 
     is_team_member = _is_email_in_team(email)
     if not is_team_member and acc.get("status") in (STATUS_ACTIVE, STATUS_EXHAUSTED, STATUS_AUTH_PENDING):
@@ -1395,52 +1397,42 @@ def invite_to_team(chatgpt_api, email, seat_type="default"):
 
 def _complete_registration(email, password, invite_link, mail_client):
     """完成注册 + Codex 登录（从已有邀请链接继续）"""
-    from playwright.sync_api import sync_playwright
-
-    from autoteam.invite import register_with_invite
+    from autoteam.robust_flow import RobustFlow
+    from autoteam.codex_auth import _ensure_auto_provision_enabled
 
     signup_profile = generate_signup_profile()
+    birthdate = f"{signup_profile.birth_year:04d}-{signup_profile.birth_month:02d}-{signup_profile.birth_day:02d}"
 
-    logger.info("[注册] 开始注册 %s...", email)
-    with sync_playwright() as p:
-        try:
-            browser = p.chromium.launch(**get_playwright_launch_options())
-            clear_last_easyproxy_assignment()
-        except Exception as exc:
-            mark_last_easyproxy_assignment_bad(str(exc))
-            raise
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
-        result, password = register_with_invite(
-            page,
-            invite_link,
-            email,
-            mail_client,
-            password=password,
-            signup_profile=signup_profile,
-        )
-        browser.close()
-
-    if not result:
-        logger.error("[注册] 注册 %s 失败", email)
-        return None
-
-    # Codex 登录
-    login_result = _login_codex_with_result(
-        email,
-        password,
+    logger.info("[register] start pending invite completion: %s", email)
+    _ensure_auto_provision_enabled()
+    flow = RobustFlow(
         mail_client=mail_client,
+        workspace_name=get_chatgpt_workspace_name(),
+        account_id=get_chatgpt_account_id(),
+        tag="register",
         signup_profile=signup_profile,
     )
+    try:
+        flow.start()
+        flow.run_register(email, password, signup_profile.full_name, birthdate)
+        if invite_link and not _is_email_in_team(email):
+            joined = flow.accept_invite(invite_link, email=email)
+            if not joined and not _is_email_in_team(email):
+                logger.warning("[register] invite join not confirmed: %s", email)
+                return None
+        login_result = flow.oauth_team(email, password)
+    except Exception as exc:
+        logger.error("[register] failed: %s", exc)
+        return None
+    finally:
+        flow.close()
+
     bundle = login_result.get("bundle")
     if login_result.get("ok") and bundle:
         auth_file = save_auth_file(bundle)
         update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
         _auth_repair_reset(email)
-        logger.info("[注册] 账号就绪: %s", email)
+        logger.info("[register] account ready: %s", email)
         return email
     else:
         result = _record_auth_repair_failure(
@@ -1451,7 +1443,7 @@ def _complete_registration(email, password, invite_link, mail_client):
         )
         extra = _auth_repair_result_suffix(result)
         logger.warning(
-            "[注册] 账号已加入 Team 但 Codex 登录失败，标记为 %s: %s（%s%s）",
+            "[register] oauth failed, mark %s: %s (%s%s)",
             result.get("status"),
             email,
             _auth_repair_error_label(result.get("auth_last_error")),
@@ -2481,79 +2473,88 @@ def create_account_direct(mail_client):
     """
     import uuid
 
-    account_id, email = mail_client.create_temp_email()
-    password = f"Tmp_{uuid.uuid4().hex[:12]}!"
-    signup_profile = generate_signup_profile()
+    from autoteam.robust_flow import RobustFlow
+    from autoteam.codex_auth import _ensure_auto_provision_enabled
 
-    success = False
+    _ensure_auto_provision_enabled()
     for attempt in range(3):
-        logger.info("[直接注册] 开始第 %d/3 次注册尝试: %s", attempt + 1, email)
-        success = _register_direct_once(
-            mail_client,
-            email,
-            password,
-            mail_account_id=account_id,
+        account_id, email = mail_client.create_temp_email()
+        password = f"Tmp_{uuid.uuid4().hex[:12]}!"
+        signup_profile = generate_signup_profile()
+        birthdate = f"{signup_profile.birth_year:04d}-{signup_profile.birth_month:02d}-{signup_profile.birth_day:02d}"
+
+        logger.info("[direct-register] attempt %d/3: %s", attempt + 1, email)
+        flow = RobustFlow(
+            mail_client=mail_client,
+            workspace_name=get_chatgpt_workspace_name(),
+            account_id=get_chatgpt_account_id(),
+            mailbox_id=account_id,
+            tag="direct-register",
             signup_profile=signup_profile,
         )
-        if success:
-            break
-
-        if _is_email_in_team(email):
-            logger.info("[直接注册] 远端确认账号已在 Team 中，视为注册成功: %s", email)
-            success = True
-            break
-
-        if attempt < 2:
-            logger.warning("[直接注册] 注册失败且账号不在 Team 中，60 秒后重试: %s", email)
-            time.sleep(60)
-
-    if not success:
-        logger.error("[直接注册] 连续 3 次注册失败，删除临时账号: %s", email)
+        registered = False
+        added_to_pool = False
         try:
-            mail_client.delete_account(account_id)
+            flow.start()
+            flow.run_register(email, password, signup_profile.full_name, birthdate)
+            registered = True
+
+            team_ready = False
+            for _ in range(3):
+                if _is_email_in_team(email):
+                    team_ready = True
+                    break
+                time.sleep(2)
+            if not team_ready:
+                raise RuntimeError("team membership not confirmed after register")
+
+            add_account(
+                email,
+                password,
+                cloudmail_account_id=account_id if getattr(mail_client, "provider_name", "") == "cloudmail" else None,
+                mail_provider=getattr(mail_client, "provider_name", ""),
+                mail_account_id=account_id,
+                mail_service_id=getattr(mail_client, "service_id", None),
+            )
+            added_to_pool = True
+
+            login_result = flow.oauth_team(email, password)
+            bundle = login_result.get("bundle")
+            if login_result.get("ok") and bundle:
+                auth_file = save_auth_file(bundle)
+                update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
+                _auth_repair_reset(email)
+                logger.info("[direct-register] ready: %s", email)
+                return email
+
+            result = _record_auth_repair_failure(
+                email,
+                login_result.get("error_type"),
+                login_result.get("error_detail"),
+                release_team_seat=True,
+            )
+            extra = _auth_repair_result_suffix(result)
+            logger.warning(
+                "[direct-register] oauth failed, mark %s: %s (%s%s)",
+                result.get("status"),
+                email,
+                _auth_repair_error_label(result.get("auth_last_error")),
+                extra,
+            )
+            return None
         except Exception as exc:
-            logger.warning("[直接注册] 删除失败临时邮箱异常: %s", exc)
-        return None
+            logger.warning("[direct-register] discard attempt for %s: %s", email, exc)
+            if not added_to_pool:
+                try:
+                    mail_client.delete_account(account_id)
+                except Exception as delete_exc:
+                    logger.warning("[direct-register] delete temp mailbox failed: %s", delete_exc)
+            if registered and attempt == 2:
+                logger.error("[direct-register] register failed after 3 attempts: %s", email)
+        finally:
+            flow.close()
 
-    add_account(
-        email,
-        password,
-        cloudmail_account_id=account_id if getattr(mail_client, "provider_name", "") == "cloudmail" else None,
-        mail_provider=getattr(mail_client, "provider_name", ""),
-        mail_account_id=account_id,
-        mail_service_id=getattr(mail_client, "service_id", None),
-    )
-
-    # Step 4: Codex 登录
-    login_result = _login_codex_with_result(
-        email,
-        password,
-        mail_client=mail_client,
-        signup_profile=signup_profile,
-    )
-    bundle = login_result.get("bundle")
-    if login_result.get("ok") and bundle:
-        auth_file = save_auth_file(bundle)
-        update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
-        _auth_repair_reset(email)
-        logger.info("[直接注册] 账号就绪: %s", email)
-        return email
-    else:
-        result = _record_auth_repair_failure(
-            email,
-            login_result.get("error_type"),
-            login_result.get("error_detail"),
-            release_team_seat=True,
-        )
-        extra = _auth_repair_result_suffix(result)
-        logger.warning(
-            "[直接注册] 账号已加入 Team 但 Codex 登录失败，标记为 %s: %s（%s%s）",
-            result.get("status"),
-            email,
-            _auth_repair_error_label(result.get("auth_last_error")),
-            extra,
-        )
-        return None
+    return None
 
 
 def create_new_account(chatgpt_api, mail_client):

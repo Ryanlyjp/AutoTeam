@@ -1614,6 +1614,18 @@ def _normalized_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
+def _normalize_bulk_account_emails(emails: list[str] | None) -> list[str]:
+    normalized_emails = []
+    seen = set()
+    for value in emails or []:
+        email = _normalized_email(value)
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        normalized_emails.append(email)
+    return normalized_emails
+
+
 def _is_main_account_email(email: str | None) -> bool:
     from autoteam.admin_state import get_admin_email
 
@@ -2367,6 +2379,39 @@ def get_standby():
     return [_sanitize_account(a) for a in accounts]
 
 
+def _build_deleted_account_result(email: str, cleanup: dict):
+    message = "账号删除完成"
+    remote_errors = cleanup.get("remote_errors") or {}
+    if remote_errors:
+        from autoteam.sync_targets import describe_sync_targets
+
+        message = (
+            f"账号删除完成（{describe_sync_targets(list(remote_errors))} 远端清理失败，"
+            "详情见 cleanup.remote_errors）"
+        )
+    return {
+        "message": message,
+        "deleted_email": email,
+        "cleanup": cleanup,
+    }
+
+
+def _delete_managed_account_once(email: str):
+    from autoteam.account_ops import delete_managed_account
+    from autoteam.accounts import load_accounts
+
+    normalized_email = _normalized_email(email)
+    if _is_main_account_email(normalized_email):
+        raise HTTPException(status_code=400, detail="主号不允许删除")
+
+    accounts = load_accounts()
+    if not any(_normalized_email(a.get("email")) == normalized_email for a in accounts):
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    cleanup = _pw_executor.run(delete_managed_account, normalized_email)
+    return _build_deleted_account_result(normalized_email, cleanup)
+
+
 @app.delete("/api/accounts/{email}")
 def delete_account(email: str):
     """删除本地管理账号及其关联资源。"""
@@ -2386,33 +2431,55 @@ def delete_account(email: str):
         )
 
     try:
-        from autoteam.account_ops import delete_managed_account
-        from autoteam.accounts import load_accounts
-
-        if _is_main_account_email(email):
-            raise HTTPException(status_code=400, detail="主号不允许删除")
-
-        accounts = load_accounts()
-        if not any(a["email"].lower() == email.lower() for a in accounts):
-            raise HTTPException(status_code=404, detail="账号不存在")
-
-        cleanup = _pw_executor.run(delete_managed_account, email)
-        message = "账号删除完成"
-        remote_errors = cleanup.get("remote_errors") or {}
-        if remote_errors:
-            from autoteam.sync_targets import describe_sync_targets
-
-            message = (
-                f"账号删除完成（{describe_sync_targets(list(remote_errors))} 远端清理失败，"
-                "详情见 cleanup.remote_errors）"
-            )
-        return {
-            "message": message,
-            "deleted_email": email,
-            "cleanup": cleanup,
-        }
+        return _delete_managed_account_once(email)
     finally:
         _playwright_lock.release()
+
+
+def _delete_accounts_bulk(emails: list[str]):
+    normalized_emails = _normalize_bulk_account_emails(emails)
+    if not normalized_emails:
+        raise HTTPException(status_code=400, detail="请至少提供一个有效邮箱")
+
+    deleted = []
+    missing = []
+    skipped_main = []
+    failed = []
+
+    for email in normalized_emails:
+        if _is_main_account_email(email):
+            skipped_main.append(email)
+            continue
+        try:
+            deleted.append(_delete_managed_account_once(email))
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                missing.append(email)
+                continue
+            detail = exc.detail
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("detail") or str(detail)
+            failed.append({"email": email, "error": str(detail)})
+        except Exception as exc:
+            failed.append({"email": email, "error": str(exc)})
+
+    parts = [f"Deleted {len(deleted)} account(s)"]
+    if skipped_main:
+        parts.append(f"skipped main {len(skipped_main)}")
+    if missing:
+        parts.append(f"missing {len(missing)}")
+    if failed:
+        parts.append(f"failed {len(failed)}")
+
+    return {
+        "message": ", ".join(parts),
+        "deleted_count": len(deleted),
+        "deleted_emails": [item["deleted_email"] for item in deleted],
+        "deleted_items": deleted,
+        "skipped_main_accounts": skipped_main,
+        "missing_emails": missing,
+        "failed_accounts": failed,
+    }
 
 
 def _toggle_account_disabled(email: str, disabled: bool):
@@ -2440,14 +2507,7 @@ def _toggle_account_disabled(email: str, disabled: bool):
 def _toggle_accounts_disabled(emails: list[str], disabled: bool):
     from autoteam.accounts import load_accounts, save_accounts
 
-    normalized_emails = []
-    seen = set()
-    for value in emails or []:
-        email = _normalized_email(value)
-        if not email or email in seen:
-            continue
-        seen.add(email)
-        normalized_emails.append(email)
+    normalized_emails = _normalize_bulk_account_emails(emails)
 
     if not normalized_emails:
         raise HTTPException(status_code=400, detail="请至少提供一个有效邮箱")
@@ -2514,6 +2574,30 @@ def post_bulk_disable_accounts(params: BulkAccountDisableParams):
 def post_bulk_enable_accounts(params: BulkAccountDisableParams):
     """批量启用账号：恢复这些账号参与自动轮转/巡检/同步。"""
     return _toggle_accounts_disabled(params.emails, False)
+
+
+@app.post("/api/accounts/bulk/delete")
+def post_bulk_delete_accounts(params: BulkAccountDisableParams):
+    """Batch delete accounts by reusing the existing single-account cleanup flow."""
+    _ensure_runtime_active("删除账号")
+    if not _playwright_lock.acquire(blocking=False):
+        running = _tasks.get(_current_task_id, {})
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "有任务正在执行，请等待完成后再删除账号",
+                "running_task": {
+                    "task_id": _current_task_id,
+                    "command": running.get("command", "unknown"),
+                    "started_at": running.get("started_at"),
+                },
+            },
+        )
+
+    try:
+        return _delete_accounts_bulk(params.emails)
+    finally:
+        _playwright_lock.release()
 
 
 @app.post("/api/accounts/{email}/disable")

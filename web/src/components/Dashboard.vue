@@ -31,6 +31,13 @@
               : 'bg-emerald-600/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-600/20'">
             {{ bulkUpdating ? '批量处理中...' : `一键启用${selectedEnableTargets.length ? `（${selectedEnableTargets.length}）` : ''}` }}
           </button>
+          <button @click="bulkDeleteSelected" :disabled="bulkDeleteDisabled"
+            class="px-3 py-1.5 text-xs rounded-lg border transition disabled:opacity-50"
+            :class="bulkDeleteDisabled
+              ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
+              : 'bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20'">
+            {{ bulkUpdating ? 'Processing...' : `Delete selected${selectedDeleteTargets.length ? ` (${selectedDeleteTargets.length})` : ''}` }}
+          </button>
           <button @click="resetQuotaRecovery" :disabled="resetDisabled"
             class="btn-secondary px-3 py-1.5 text-xs disabled:opacity-50"
             :class="resetDisabled
@@ -245,9 +252,11 @@ const resetDisabled = computed(() => resetting.value || !!props.runningTask)
 const selectableAccounts = computed(() => (props.status?.accounts || []).filter(isBulkSelectable))
 const selectedDisableTargets = computed(() => selectableAccounts.value.filter(acc => selectedEmails.value.includes(acc.email) && !acc.disabled))
 const selectedEnableTargets = computed(() => selectableAccounts.value.filter(acc => selectedEmails.value.includes(acc.email) && acc.disabled))
+const selectedDeleteTargets = computed(() => selectableAccounts.value.filter(acc => selectedEmails.value.includes(acc.email)))
 const allSelectableSelected = computed(() => !!selectableAccounts.value.length && selectedEmails.value.length === selectableAccounts.value.length)
 const bulkDisableDisabled = computed(() => actionDisabled.value || !selectedDisableTargets.value.length)
 const bulkEnableDisabled = computed(() => actionDisabled.value || !selectedEnableTargets.value.length)
+const bulkDeleteDisabled = computed(() => actionDisabled.value || !selectedDeleteTargets.value.length)
 
 const cards = computed(() => {
   if (!props.status) return []
@@ -558,6 +567,32 @@ async function bulkEnableSelected() {
   try {
     const result = await api.bulkEnableAccounts(emails)
     message.value = result.message || `已启用 ${emails.length} 个账号`
+    messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
+    selectedEmails.value = []
+    emit('refresh')
+  } catch (e) {
+    message.value = e.message
+    messageClass.value = 'bg-red-500/10 text-red-400 border-red-500/20'
+  } finally {
+    bulkUpdating.value = false
+    setTimeout(() => { message.value = '' }, 8000)
+  }
+}
+
+async function bulkDeleteSelected() {
+  if (bulkDeleteDisabled.value) return
+
+  const emails = selectedDeleteTargets.value.map(acc => acc.email)
+  const ok = window.confirm(
+    `Confirm deleting these ${emails.length} accounts?\nThis uses the same cleanup flow as single delete: local records, configured remotes, Team/Invite, and the mailbox provider will all be cleaned.`
+  )
+  if (!ok) return
+
+  bulkUpdating.value = true
+  message.value = ''
+  try {
+    const result = await api.bulkDeleteAccounts(emails)
+    message.value = result.message || `Deleted ${emails.length} account(s)`
     messageClass.value = 'bg-green-500/10 text-green-400 border-green-500/20'
     selectedEmails.value = []
     emit('refresh')

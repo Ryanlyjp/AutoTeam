@@ -1,3 +1,6 @@
+import sys
+import types
+
 import requests
 
 from autoteam import codex_auth
@@ -68,6 +71,45 @@ def test_login_codex_via_session_returns_none_when_flow_requires_more_steps(monk
 
     assert bundle is None
     assert [name for name, _ in events[1:]] == ["start", "stop"]
+
+
+def test_session_codex_auth_flow_uses_robust_flow(monkeypatch):
+    events = []
+
+    class FakeRobustFlow:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+
+        def start(self):
+            events.append(("start", None))
+
+        def oauth_team_via_session(self, email, session_token):
+            events.append(("oauth", email, session_token))
+            return {"ok": True, "bundle": {"email": email, "plan_type": "team", "account_id": "acc-1"}}
+
+        def close(self):
+            events.append(("close", None))
+
+    fake_module = types.ModuleType("autoteam.robust_flow")
+    fake_module.RobustFlow = FakeRobustFlow
+    monkeypatch.setitem(sys.modules, "autoteam.robust_flow", fake_module)
+    monkeypatch.setattr(codex_auth, "_ensure_auto_provision_enabled", lambda: False)
+
+    flow = codex_auth.SessionCodexAuthFlow(
+        email="owner@example.com",
+        session_token="session-token",
+        account_id="acc-1",
+        workspace_name="Idapro",
+        auth_file_callback=lambda bundle: f"/tmp/{bundle['email']}.json",
+    )
+
+    result = flow.start()
+    info = flow.complete()
+    flow.stop()
+
+    assert result == {"step": "completed", "detail": None}
+    assert info["bundle"]["email"] == "owner@example.com"
+    assert [name for name, _ in events] == ["init", "start", "oauth", "close"]
 
 
 def test_refresh_main_auth_file_saves_bundle_from_session_login(monkeypatch):

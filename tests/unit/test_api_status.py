@@ -205,6 +205,70 @@ def test_bulk_enable_accounts_updates_disabled_rows_only(tmp_path, monkeypatch):
     assert stored["owner@example.com"]["disabled"] is False
 
 
+def test_bulk_delete_accounts_reuses_single_delete_flow_and_skips_missing_and_main(tmp_path, monkeypatch):
+    accounts_file = tmp_path / "accounts.json"
+    monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
+    monkeypatch.setattr(accounts, "get_admin_email", lambda: "owner@example.com")
+    monkeypatch.setattr(api, "_is_main_account_email", lambda email: email == "owner@example.com")
+    monkeypatch.setattr(api, "_playwright_lock", threading.Lock())
+    monkeypatch.setattr(api, "_ensure_runtime_active", lambda *_args, **_kwargs: None)
+
+    seen = []
+
+    def fake_delete_managed_account(email, **_kwargs):
+        seen.append(email)
+        return {"remote_errors": {}}
+
+    monkeypatch.setattr("autoteam.account_ops.delete_managed_account", fake_delete_managed_account)
+    monkeypatch.setattr(api._pw_executor, "run", lambda func, *args, **kwargs: func(*args, **kwargs))
+
+    accounts.save_accounts(
+        [
+            {"email": "first@example.com", "status": "standby", "disabled": False},
+            {"email": "second@example.com", "status": "active", "disabled": False},
+            {"email": "owner@example.com", "status": "active", "disabled": False},
+        ]
+    )
+
+    result = api.post_bulk_delete_accounts(
+        api.BulkAccountDisableParams(
+            emails=[
+                "first@example.com",
+                "second@example.com",
+                "owner@example.com",
+                "missing@example.com",
+                "first@example.com",
+            ]
+        )
+    )
+
+    assert seen == ["first@example.com", "second@example.com"]
+    assert result["deleted_count"] == 2
+    assert result["deleted_emails"] == ["first@example.com", "second@example.com"]
+    assert result["skipped_main_accounts"] == ["owner@example.com"]
+    assert result["missing_emails"] == ["missing@example.com"]
+    assert result["failed_accounts"] == []
+
+
+def test_delete_account_uses_shared_delete_helper(tmp_path, monkeypatch):
+    accounts_file = tmp_path / "accounts.json"
+    monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)
+    monkeypatch.setattr(accounts, "get_admin_email", lambda: "owner@example.com")
+    monkeypatch.setattr(api, "_is_main_account_email", lambda email: email == "owner@example.com")
+    monkeypatch.setattr(api, "_playwright_lock", threading.Lock())
+    monkeypatch.setattr(api, "_ensure_runtime_active", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        api,
+        "_delete_managed_account_once",
+        lambda email: {"message": "账号删除完成", "deleted_email": email, "cleanup": {"remote_errors": {}}},
+    )
+
+    result = api.delete_account("member@example.com")
+
+    assert result["deleted_email"] == "member@example.com"
+    assert result["message"] == "账号删除完成"
+
+
 def test_get_status_counts_disabled_and_skips_disabled_quota_checks(tmp_path, monkeypatch):
     enabled_auth = tmp_path / "enabled.json"
     disabled_auth = tmp_path / "disabled.json"
