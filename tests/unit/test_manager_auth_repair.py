@@ -500,19 +500,12 @@ def test_check_and_refresh_skips_refresh_when_quota_auth_is_hard_unauthorized(tm
     assert info == {"reason": "unauthorized", "status_code": 401}
 
 
-def test_cmd_check_deletes_hard_401_auth_accounts_instead_of_relogin(tmp_path, monkeypatch):
+def test_cmd_check_marks_active_hard_401_auth_accounts_exhausted_for_rotation(tmp_path, monkeypatch):
     auth_file = tmp_path / "auth.json"
     auth_file.write_text(json.dumps({"access_token": "token-401"}), encoding="utf-8")
 
-    deleted = []
-    synced = []
-
-    class _FakeChatGPT:
-        def start(self):
-            return None
-
-        def stop(self):
-            return None
+    updates = []
+    resets = []
 
     monkeypatch.setattr(
         manager,
@@ -534,14 +527,13 @@ def test_cmd_check_deletes_hard_401_auth_accounts_instead_of_relogin(tmp_path, m
         "_check_and_refresh",
         lambda _acc: ("auth_error", {"reason": "unauthorized", "status_code": 401}),
     )
-    monkeypatch.setattr(manager, "ChatGPTTeamAPI", _FakeChatGPT)
-    monkeypatch.setattr(manager, "_get_account_mail_client", lambda _acc: _FakeMailClient())
+    monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
+    monkeypatch.setattr(manager, "_auth_repair_reset", lambda email: resets.append(email))
     monkeypatch.setattr(
         manager,
-        "delete_managed_account",
-        lambda email, **kwargs: deleted.append((email, kwargs["remove_remote"], kwargs["sync_cpa_after"])),
+        "_delete_accounts_with_broken_auth",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("hard 401/403 auth should not delete immediately")),
     )
-    monkeypatch.setattr(manager, "sync_to_cpa", lambda: synced.append("sync"))
     monkeypatch.setattr(
         manager,
         "_login_codex_with_result",
@@ -550,9 +542,15 @@ def test_cmd_check_deletes_hard_401_auth_accounts_instead_of_relogin(tmp_path, m
 
     exhausted = manager.cmd_check(force_auth_repair=False)
 
-    assert exhausted == []
-    assert deleted == [("user@example.com", True, False)]
-    assert synced == ["sync"]
+    assert [acc["email"] for acc in exhausted] == ["user@example.com"]
+    assert resets == ["user@example.com"]
+    assert any(
+        email == "user@example.com"
+        and kwargs.get("status") == manager.STATUS_EXHAUSTED
+        and kwargs.get("last_quota") is None
+        and kwargs.get("quota_resets_at") is None
+        for email, kwargs in updates
+    )
 
 
 def test_cmd_check_preserves_low_active_for_seat2_preswitch(tmp_path, monkeypatch):

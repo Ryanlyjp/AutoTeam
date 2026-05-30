@@ -3298,7 +3298,7 @@ def _auto_check_wait(interval_seconds, poll_seconds=0.2):
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
     from autoteam.accounts import STATUS_ACTIVE, STATUS_AUTH_PENDING, is_account_disabled, load_accounts
-    from autoteam.codex_auth import check_codex_quota, quota_auth_error_is_unauthorized
+    from autoteam.codex_auth import check_codex_quota
     from autoteam.manager import (
         _auth_repair_skip_reason,
         _count_pool_active_accounts,
@@ -3343,6 +3343,7 @@ def _auto_check_loop():
                 auth_data = json.loads(read_text(Path(acc["auth_file"])))
                 access_token = auth_data.get("access_token")
                 if not access_token:
+                    auth_problem_accounts.append(acc["email"])
                     continue
                 status, info = check_codex_quota(access_token)
                 if status == "ok" and isinstance(info, dict):
@@ -3351,7 +3352,7 @@ def _auto_check_loop():
                         low_accounts.append((acc["email"], remaining, status, info))
                 elif status == "exhausted":
                     low_accounts.append((acc["email"], 0, status, info))
-                elif status == "auth_error" and quota_auth_error_is_unauthorized(info):
+                elif status == "auth_error":
                     auth_problem_accounts.append(acc["email"])
             except Exception:
                 pass

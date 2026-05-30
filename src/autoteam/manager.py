@@ -884,7 +884,7 @@ def _check_and_refresh(acc):
     status, info = check_codex_quota(access_token)
     if status == "auth_error" and quota_auth_error_is_unauthorized(info):
         logger.warning(
-            "[%s] quota auth returned HTTP %s; skip refresh and hand off to delete-and-refill flow",
+            "[%s] quota auth returned HTTP %s; skip refresh and hand off to rotation flow",
             email,
             quota_auth_error_status_code(info),
         )
@@ -1079,8 +1079,6 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
     # 检查有认证文件的账号额度
     exhausted_list = []
     auth_error_list = []
-    broken_auth_delete_list = []
-
     if active_with_auth:
         logger.info("[检查] 检查 %d 个 active/auth_pending 账号的额度...", len(active_with_auth))
         for acc in active_with_auth:
@@ -1178,14 +1176,6 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                 )
                 exhausted_list.append(acc)
             elif status_str == "auth_error":
-                if quota_auth_error_is_unauthorized(info):
-                    logger.warning(
-                        "[%s] quota auth returned HTTP %s; delete account and let refill recover seats",
-                        email,
-                        quota_auth_error_status_code(info),
-                    )
-                    broken_auth_delete_list.append(acc)
-                    continue
                 # token 失效，先看历史额度（重置时间已过的不算）
                 lq = acc.get("last_quota")
                 if lq:
@@ -1222,6 +1212,19 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                     else:
                         logger.info("[%s] token 失效但 5h 重置时间已过，需重新登录验证", email)
                 logger.warning("[%s] 认证失败，需要重新登录 Codex", email)
+                if not was_auth_pending:
+                    logger.warning("[%s] quota auth unavailable; mark account exhausted so rotate can move it to standby", email)
+                    _auth_repair_reset(email)
+                    update_account(
+                        email,
+                        status=STATUS_EXHAUSTED,
+                        last_quota=None,
+                        quota_exhausted_at=time.time(),
+                        quota_resets_at=None,
+                        quota_window=None,
+                    )
+                    exhausted_list.append(acc)
+                    continue
                 skip_reason = _auth_repair_skip_reason(acc, force=force_auth_repair)
                 if skip_reason:
                     skipped_repairs.append((email, skip_reason))
@@ -1240,10 +1243,6 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
         for a in no_auth_list:
             logger.info("[检查]   %s", a["email"])
         auth_error_list.extend(no_auth_list)
-    if broken_auth_delete_list:
-        logger.info("[check] deleting %d hard-invalid auth accounts (HTTP 401/403)...", len(broken_auth_delete_list))
-        deleted_emails = _delete_accounts_with_broken_auth(broken_auth_delete_list)
-        logger.info("[check] deleted %d hard-invalid auth accounts", len(deleted_emails))
     # auth_error + 无认证文件的统一重新登录 Codex
     if auth_error_list:
         logger.info("[检查] 重新登录 %d 个认证失效/待修复的账号...", len(auth_error_list))
