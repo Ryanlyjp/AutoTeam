@@ -112,6 +112,7 @@ def _abort_if_cancel_requested():
 
 
 AUTH_REPAIR_HARD_FAILURE_TYPES = {"human_verification", "account_deactivated"}
+AUTH_REPAIR_DISABLE_ACCOUNT_FAILURE_TYPES = {"add_phone", "account_deactivated"}
 AUTH_REPAIR_SINGLE_ATTEMPT_FAILURE_TYPES = {"add_phone", "human_verification", "account_deactivated"}
 
 
@@ -406,33 +407,20 @@ def _record_auth_repair_failure(
     error_detail = error_detail or _auth_repair_error_label(error_type)
     retry_delays = _auth_repair_retry_delays()
     should_release_team_seat = bool(release_team_seat)
+    should_disable_account = error_type in AUTH_REPAIR_DISABLE_ACCOUNT_FAILURE_TYPES
 
-    if error_type == "add_phone" and _auth_repair_retry_add_phone_enabled():
-        prev_count = int(acc.get("auth_retry_count") or 0) if acc.get("auth_last_error") == "add_phone" else 0
-        next_count = prev_count + 1
-        max_retries = _auth_repair_add_phone_max_retries()
-        add_phone_delays = _auth_repair_add_phone_retry_delays(max_retries)
-
-        if next_count > max_retries:
-            state = {
-                "auth_retry_count": next_count,
-                "auth_last_error": error_type,
-                "auth_last_error_detail": error_detail,
-                "auth_last_failed_at": now,
-                "auth_retry_after": None,
-                "auth_retry_paused": True,
-            }
-            should_release_team_seat = True
-        else:
-            state = {
-                "auth_retry_count": next_count,
-                "auth_last_error": error_type,
-                "auth_last_error_detail": error_detail,
-                "auth_last_failed_at": now,
-                "auth_retry_after": now + add_phone_delays[next_count - 1],
-                "auth_retry_paused": False,
-            }
-    elif error_type in AUTH_REPAIR_HARD_FAILURE_TYPES or error_type == "add_phone":
+    if error_type == "add_phone":
+        retry_count = max(int(acc.get("auth_retry_count") or 0) + 1, 1)
+        state = {
+            "auth_retry_count": retry_count,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": None,
+            "auth_retry_paused": True,
+        }
+        should_release_team_seat = True
+    elif error_type in AUTH_REPAIR_HARD_FAILURE_TYPES:
         retry_count = max(int(acc.get("auth_retry_count") or 0), len(retry_delays))
         state = {
             "auth_retry_count": retry_count,
@@ -457,7 +445,7 @@ def _record_auth_repair_failure(
         }
 
     update_account(email, **state)
-    if error_type == "account_deactivated":
+    if should_disable_account:
         update_account(email, disabled=True)
 
     is_team_member = _is_email_in_team(email)
